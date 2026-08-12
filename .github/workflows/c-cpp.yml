@@ -1,0 +1,31 @@
+name: C/C++ CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build:
+
+    runs-on: macos-26
+
+    steps:
+    - uses: actions/checkout@v4
+    # Fetch only the submodules the build actually needs:
+    #   libkext                    - the kernel library lib/Makefile builds
+    #
+    # Deliberately excluded: lib/xnu is huge and unused at build time (the tree
+    # ships the needed headers under include/xnu), MacKernelSDK uses an SSH URL
+    # that CI cannot authenticate.
+    - name: Check out the build submodules
+      run: |
+        git submodule update --init \
+          lib/libkext
+    - name: make ARCH=arm64e
+      run: make ARCH=arm64e
+    - name: make ARCH=x86_64
+      run: make ARCH=x86_64
+    - name: make ARCH=universal
+      run: make ARCH=universal

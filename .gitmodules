@@ -5,6 +5,3 @@
 	path = lib/xnu
 	url = https://github.com/apple-oss-distributions/xnu.git
         ignore = dirty
-[submodule "lib/MacKernelSDK"]
-	path = lib/MacKernelSDK
-	url = https://github.com/acidanthera/MacKernelSDK.git

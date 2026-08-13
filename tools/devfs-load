@@ -1,0 +1,98 @@
+#!/bin/sh
+#
+# devfs-load - boot-time loader for the devfs kext.
+#
+# Run by the com.beako.devfs LaunchDaemon at boot (RunAtLoad), one-shot.
+#
+# WHY THIS EXISTS: being present in /Library/Extensions - and even being
+# prelinked into the auxiliary kernel collection - does not get a kext STARTED.
+# The auxKC only maps it; something has to ask kernelmanagement to load it. The
+# IOKitPersonalities/IOResources entry in Info.plist is not enough on its own
+# (verified on macOS 26.5.2: devfs sat prelinked in the auxKC across a full
+# boot without its _start ever running). The procfs/sysfs siblings have the same
+# personality and are likewise loaded by a LaunchDaemon at boot, not by IOKit
+# matching. This script is that daemon.
+#
+# Auto-load is gated behind an arm flag so a fault in kernel code cannot
+# boot-loop the machine: nothing happens until an operator runs
+#     sudo touch /var/db/devfs.enabled
+# Remove that file to disable auto-load again. This mirrors the procfs
+# (/var/db/procfs.enabled) and devfs (/var/db/devfs.enabled) siblings.
+#
+# `--force` skips the arm-flag check. It is for a deliberate, interactive load
+# (`sudo make load`), which is the SAFER way to try a suspect build: if it wedges
+# the machine, a power cycle comes back to a working system, because the boot
+# daemon is still disarmed and will not retry. Arming the flag is for when the
+# kext is known-good and you want it at every boot.
+#
+set -u
+
+ARM_FLAG="/var/db/devfs.enabled"
+KEXT="/Library/Extensions/devfs.kext"
+BUNDLE_ID="com.beako.filesystems.devfs"
+TRIES=30
+FORCE=0
+
+[ "${1:-}" = "--force" ] && FORCE=1
+
+log() { echo "devfs-load: $*"; }
+
+kext_loaded() {
+    kmutil showloaded 2>/dev/null | grep -q "$BUNDLE_ID"
+}
+
+if [ "$FORCE" -eq 0 ] && [ ! -e "$ARM_FLAG" ]; then
+    log "disarmed ($ARM_FLAG absent); not loading. Arm with: sudo touch $ARM_FLAG"
+    exit 0
+fi
+
+if [ ! -d "$KEXT" ]; then
+    log "$KEXT is not installed; nothing to load."
+    exit 1
+fi
+
+# Load by path rather than by bundle id - the reliable route at boot - and poll
+# until the kext actually shows up, retrying in case kernelmanagement was not
+# ready on the first attempt.
+#
+# Retry only helps for transient "not ready yet" failures. A missing user
+# approval is NOT transient: it needs a human in System Settings and then a
+# reboot, and hammering kmutil 30 times at boot only buries the real message.
+# Bail out on it immediately with something actionable.
+i=0
+while [ "$i" -lt "$TRIES" ]; do
+    if kext_loaded; then
+        break
+    fi
+    log "loading kext $KEXT (attempt $((i + 1)))"
+    out=$(kmutil load -p "$KEXT" 2>&1)
+    [ -n "$out" ] && log "kmutil load: $out"
+
+    case "$out" in
+    *"not approved"*|*"approve using System Settings"*)
+        log ""
+        log "NOT APPROVED - this is a one-time, manual step:"
+        log "  1. System Settings > Privacy & Security, allow system software"
+        log "     from \"Apple Development: sunnevanattsol@gmail.com\"."
+        log "  2. Reboot. Approval only takes effect once the auxiliary kernel"
+        log "     collection is rebuilt, which happens at boot."
+        log "Note that a REBUILT kext needs this dance again: its cdhash"
+        log "changed, so the standing approval no longer covers it."
+        exit 1
+        ;;
+    esac
+
+    kext_loaded && break
+    i=$((i + 1))
+    sleep 1
+done
+
+if ! kext_loaded; then
+    log "kext did not load after ${TRIES}s; giving up (needs approval in"
+    log "System Settings > Privacy & Security, or a rebuilt/installed kext)."
+    exit 1
+fi
+
+log "loaded $BUNDLE_ID"
+
+exit 0

@@ -1,6 +1,6 @@
 # mSL/DevFS
 
-[![C/C++ CI](https://github.com/mslxnu/mSL-DevFS/actions/workflows/c-cpp.yml/badge.svg)](https://github.com/mslxnu/mSL-DevFS/actions/workflows/c-cpp.yml)
+[![C/C++ CI](https://github.com/mslxnu/devfs/actions/workflows/c-cpp.yml/badge.svg)](https://github.com/mslxnu/devfs/actions/workflows/c-cpp.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 ![Platform](https://img.shields.io/badge/platform-macOS-lightgrey.svg)
 ![Architecture](https://img.shields.io/badge/arch-arm64e%20%7C%20x86__64-blue.svg)
@@ -24,16 +24,16 @@ One module of **mSL/XNU**, a modular macOS Subsystem for Linux.
 
 | Piece | What it does | Where |
 |-------|--------------|-------|
-| **Filesystem Hierarchy Standard** | The Linux filesystem layout, natively | mSL/FHS |
-| **Syscall translation** | Linux system calls onto Darwin's, over `Hypervisor.framework` | mSL/NABI |
-| **procfs** | `/proc`, as a real filesystem | mSL/ProcFS |
-| **sysfs** | `/sys`, likewise | mSL/SysFS |
-| **devfs** | Linux device drivers macOS has no equivalent for | **this repository** |
+| **Syscall translation** | Linux system calls onto Darwin's, over `Hypervisor.framework` | [mSL/NABI](https://github.com/mslxnu/native_abi) |
+| **Filesystem Hierarchy Standard** | Native Linux-style filesystem layout | [mSL/FHS](https://github.com/mslxnu/fhs) |
+| **procfs** | `/proc`, as a native pseudo-filesystem | [mSL/ProcFS](https://github.com/mslxnu/procfs) |
+| **sysfs** | `/sys`, as a native pseudo-filesystem | [mSL/SysFS](https://github.com/mslxnu/sysfs) |
+| **devfs** | `/dev` driver add-ons for macOS | **this repository** |
 
-The sibling READMEs list `/dev` as "already part of macOS — XNU", which is true
-of the *filesystem* and beside the point for the *drivers*. macOS has a devfs;
-what it does not have is binder. SIP refuses a second devfs stacked over `/dev`
-anyway, so these nodes are published into XNU's own.
+The devfs pseudo-filesystem, mounted at `/dev`, is already present in XNU.
+What it does not have is Linux-compatible character drivers such as binder.
+SIP refuses a second devfs stacked over `/dev`, so these nodes are published
+into XNU's own.
 
 ## What is binder?
 

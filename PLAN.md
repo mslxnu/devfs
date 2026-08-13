@@ -21,6 +21,19 @@ universal, with every undefined symbol resolving against the KPI export lists:
 - `tools/binder-probe.c` — the functional test
 - `doc/NABI-INTEGRATION.md` — the NABI half, specified against real call sites
 
+## Done since the plan was written
+
+- **The descriptor broker is implemented**, on the NABI side where the spec
+  always put it (`mSL-NABI/src/fs/binder_broker.c`): a per-instance rendezvous
+  socket that moves a `BINDER_TYPE_FD` from sender to receiver over
+  `SCM_RIGHTS`, keyed by the pid the driver stamps into the cookie. The
+  send path scans the transaction's offsets during write translation and
+  registers before the ioctl queues anything; the receive path asks the
+  broker, registers the descriptor and rewrites the object's fd in the
+  receiver's arena. `mSL-NABI/test/arch/smoke/binderprobe.c` proves it
+  end to end: the client sends its own `/dev/binder` fd and the manager
+  receives a real, ioctl-answering descriptor.
+
 ## Next, in order
 
 1. **Run it.** `sudo make unload && sudo make load && make check`. The driver has
@@ -39,8 +52,7 @@ universal, with every undefined symbol resolving against the KPI export lists:
    two pointers in `binder_write_read`, provide the arena. Descriptor passing
    comes after a guest can transact at all.
 
-4. **The descriptor broker.** Only once the shim works, because its shape
-   depends on the wire traffic being real.
+4. ~~**The descriptor broker.**~~ Done — see the section added above.
 
 5. **Then the deferred pieces**, in whatever order the traffic demands them:
    `BINDER_TYPE_FDA`, nested scatter-gather, the security-context transaction

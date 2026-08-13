@@ -191,18 +191,36 @@ nothing. So the driver does what it can and leaves the rest to userspace:
 
 The broker that closes the gap is a NABI-side job, and NABI already has the
 mechanism: `SCM_RIGHTS` over `AF_UNIX`, translated in both directions
-(`src/net/net.c`). The shape:
+(`src/net/net.c`). It is implemented now:
 
-1. Every nabi instance connects to one rendezvous socket (in the runtime
-   directory, alongside the other per-instance state).
+1. Every nabi instance connects to one rendezvous socket. The first process —
+   the instance root — creates a runtime directory and the socket at startup
+   (`binder_broker_init`, `src/fs/binder_broker.c`) and remembers the path in
+   `NABI_BINDER_BROKER`, which fork children inherit and guest exec never
+   touches; the root hosts the acceptor thread.
 2. A sender that sees `BINDER_TYPE_FD` leave in a transaction registers
    `(pid, fd)` with the broker and sends the descriptor over `SCM_RIGHTS`.
-3. A receiver that sees one arrive asks the broker for `(cookie, fd)`, receives
-   the descriptor, and rewrites the object's `fd` to its own number before the
-   guest sees it.
+   This happens in the write translation (`binder_translate_write`), which
+   completes before the ioctl queues the transaction, so the receiver always
+   finds the descriptor waiting.
+3. A receiver that sees one arrive asks the broker for `(cookie, fd)`,
+   receives the descriptor, registers it with its own fd table and rewrites
+   the object's `fd` in its arena before the guest reads it
+   (`binder_translate_read`). The driver's stamp — the sender's pid in
+   `cookie` — is the key, and it is exactly the pid the driver recorded from
+   `proc_selfpid()`.
 
 The guest's `libbinder` is untouched: the substitution happens at the
-`BINDER_TYPE_FD` boundary, which is where the ABI puts descriptors.
+`BINDER_TYPE_FD` boundary, which is where the ABI puts descriptors. The test
+is `binderprobe`'s fd stage, which sends a client's own `/dev/binder` fd to
+the manager and asks the received descriptor for its version.
+
+Caveats, honestly: a registration the receiver never asks for (the driver
+refused the transaction, say) is a leaked descriptor for the broker's
+lifetime; and the receiver's substituted fd number is the one `SCM_RIGHTS`
+handed out, which NABI's 1:1 guest-fd numbering accepts rather than
+re-numbering. Both are visible in the broker's code and both are fine for the
+single-instance, same-instance traffic Waydroid produces.
 
 ---
 

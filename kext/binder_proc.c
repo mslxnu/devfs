@@ -825,18 +825,38 @@ binder_thread_read(struct binder_proc *proc, struct binder_thread *thread,
 	for (;;) {
 		struct binder_work *w = NULL;
 		bool from_proc = false;
+		bool found = false;
 
 		if (!TAILQ_EMPTY(&thread->todo)) {
-			w = TAILQ_FIRST(&thread->todo);
-			binder_dequeue_work(w);
+			TAILQ_FOREACH(w, &thread->todo, entry) {
+				if (w->type != BINDER_WORK_TRANSACTION ||
+				    !thread->frozen) {
+					found = true;
+					break;
+				}
+			}
+			if (found)
+				binder_dequeue_work(w);
 		} else if (binder_thread_takes_proc_work(thread) &&
 		    !TAILQ_EMPTY(&proc->todo)) {
-			w = TAILQ_FIRST(&proc->todo);
-			binder_dequeue_work(w);
-			from_proc = true;
+			TAILQ_FOREACH(w, &proc->todo, entry) {
+				if (w->type != BINDER_WORK_TRANSACTION ||
+				    !thread->frozen) {
+					found = true;
+					break;
+				}
+			}
+			if (found) {
+				binder_dequeue_work(w);
+				from_proc = true;
+			}
 		}
 
-		if (w == NULL) {
+		if (!found) {
+			if (thread->frozen) {
+				ret = 0;
+				break;
+			}
 			if (wrote_something) {
 				break;      /* give the client what we have */
 			}

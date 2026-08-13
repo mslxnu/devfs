@@ -185,9 +185,10 @@ nothing. So the driver does what it can and leaves the rest to userspace:
   `FLAT_BINDER_FLAG_ACCEPTS_FDS`, and passes it through with the sender's
   descriptor number in `fd` and **the sender's pid in `cookie`** (padding on
   Linux, so a receiver that ignores it behaves exactly as it would there);
-- `BINDER_TYPE_FDA`, an array of descriptors, is refused outright — there is
-  nowhere in that object to record a sender per entry, and delivering an array
-  of numbers that mean nothing in the receiver is worse than failing.
+- `BINDER_TYPE_FDA` is passed through unchanged: the kernel cannot move
+  descriptors, and the array has no per-entry cookie, but NABI's broker uses
+  the sender's pid stamped into the transaction header to translate the whole
+  array over `SCM_RIGHTS`.
 
 The broker that closes the gap is a NABI-side job, and NABI already has the
 mechanism: `SCM_RIGHTS` over `AF_UNIX`, translated in both directions

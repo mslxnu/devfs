@@ -33,6 +33,12 @@ universal, with every undefined symbol resolving against the KPI export lists:
   receiver's arena. `mSL-NABI/test/arch/smoke/binderprobe.c` proves it
   end to end: the client sends its own `/dev/binder` fd and the manager
   receives a real, ioctl-answering descriptor.
+- **`BINDER_TYPE_FDA` is supported**, passed through by the driver and
+  translated by NABI's broker: the fd array object is validated and carried
+  in the transaction, and the receiver's shim asks the broker for each
+  descriptor, registers it and rewrites the array in place. The same
+  `binderprobe` test exercises it in a `stage_fda` that sends two
+  `/dev/binder` fds and verifies both arrive usable.
 
 ## Next, in order
 
@@ -55,8 +61,8 @@ universal, with every undefined symbol resolving against the KPI export lists:
 4. ~~**The descriptor broker.**~~ Done — see the section added above.
 
 5. **Then the deferred pieces**, in whatever order the traffic demands them:
-   `BINDER_TYPE_FDA`, nested scatter-gather, the security-context transaction
-   form, freeze. Each is refused explicitly today rather than half-served.
+   nested scatter-gather, the security-context transaction form, freeze. Each
+   is refused explicitly today rather than half-served.
 
 ## Deliberately not done
 

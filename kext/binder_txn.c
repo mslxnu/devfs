@@ -531,15 +531,12 @@ binder_transaction(struct binder_proc *proc, struct binder_thread *thread,
 		}
 		case BINDER_TYPE_FDA:
 			/*
-			 * An array of descriptors. Every one of them would need the
-			 * translation the kernel cannot do, and unlike a lone
-			 * BINDER_TYPE_FD there is nowhere in the object to record the
-			 * sender for each. Refused, loudly, rather than delivered as
-			 * a list of numbers that mean nothing in the receiver.
+			 * An array of descriptors. The kernel cannot move descriptors
+			 * between processes, so the object is passed through
+			 * unchanged: NABI's userspace broker translates the array
+			 * over SCM_RIGHTS, keyed by the sender_pid the driver
+			 * stamps into the transaction header.
 			 */
-			printf("devfs: binder: BINDER_TYPE_FDA refused (pid %d); "
-			    "descriptor arrays need the userspace broker\n", proc->pid);
-			error = EINVAL;
 			break;
 		default:
 			error = EINVAL;

@@ -80,7 +80,8 @@ calls, all operating on the caller's own descriptors; `falloc`, `fp_lookup` and
 `fp_drop` are exported to nothing. `BINDER_TYPE_FD` therefore travels with the
 sender's descriptor number and the sender's pid (in a field Linux leaves as
 padding), for a userspace broker to resolve over `SCM_RIGHTS`. `BINDER_TYPE_FDA`
-is refused outright rather than delivered as numbers that mean nothing.
+is passed through to the same broker, which uses the sender's pid stamped into
+the transaction header to translate the array.
 
 **`poll()` cannot reach a third-party character device.** macOS implements
 `poll()` over kqueue, and `filt_specattach` refuses a knote on a cdev whose
@@ -128,7 +129,6 @@ that arrive without the input bit rather than acting on zeroes.
 **Not implemented:**
 
 - `BINDER_TYPE_FD` end to end (the kernel half is done; the broker is NABI's)
-- `BINDER_TYPE_FDA` descriptor arrays — refused
 - nested scatter-gather (`BINDER_BUFFER_FLAG_HAS_PARENT`) — refused
 - `BINDER_FREEZE` / `BINDER_GET_FROZEN_INFO`, oneway spam detection,
   `BINDER_GET_EXTENDED_ERROR`

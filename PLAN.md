@@ -45,6 +45,10 @@ universal, with every undefined symbol resolving against the KPI export lists:
   are accepted too; the latter clears and returns a per-process error slot.
   Transaction blocking on frozen threads is not yet enforced — the ioctls
   no longer return `ENOTTY`, which is what NABI's smoke test exercises.
+- **Nested scatter-gather (`BINDER_BUFFER_FLAG_HAS_PARENT`) is accepted**
+  by the driver, which validates the child against its parent and copies
+  the nested data independently. Transaction-level deduplication (skipping
+  the copy when the parent is also a `BINDER_TYPE_PTR`) is not yet done.
 
 ## Next, in order
 
@@ -59,10 +63,11 @@ universal, with every undefined symbol resolving against the KPI export lists:
    appear, fall back to a flat `/dev/binder-control` and say so in the README —
    the driver does not otherwise care.
 
-3. **Then the remaining deferred pieces**, in whatever order the traffic demands them:
-   nested scatter-gather, the security-context transaction form. Freeze is accepted
-   but does not yet block transactions. Each is refused explicitly today rather
-   than half-served.
+3. **The remaining deferred piece** is the security-context transaction form
+   (`BR_TRANSACTION_SEC_CTX`). NABI's shim already reserves space and translates
+   the fd and arena fields; the driver still needs to populate the `secctx`
+   pointer. Freeze does not yet block transactions, and nested scatter-gather
+   copies independently rather than deduplicating against the parent.
 
 ## Deliberately not done
 

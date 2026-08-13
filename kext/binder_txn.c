@@ -496,39 +496,58 @@ binder_transaction(struct binder_proc *proc, struct binder_thread *thread,
 			error = binder_translate_fd((struct binder_fd_object *)hdr,
 			    proc, target_node);
 			break;
-		case BINDER_TYPE_PTR: {
-			struct binder_buffer_object *bp = (struct binder_buffer_object *)hdr;
-			uint64_t need = BINDER_ALIGN(bp->length);
+	case BINDER_TYPE_PTR: {
+		struct binder_buffer_object *bp = (struct binder_buffer_object *)hdr;
+		uint64_t need = BINDER_ALIGN(bp->length);
+		void *src;
+		uint64_t src_len;
+		size_t j;
 
-			/*
-			 * Scatter-gather: the payload travels beside the parcel and
-			 * the pointer inside it is rewritten to where the receiver
-			 * will find the copy. Parent fixups - a pointer in one
-			 * scatter-gather buffer naming another - are not translated;
-			 * a parcel that asks for one is refused rather than delivered
-			 * with a pointer that means nothing in the receiver.
-			 */
-			if (bp->flags & BINDER_BUFFER_FLAG_HAS_PARENT) {
-				printf("devfs: binder: nested scatter-gather buffer "
-				    "refused (pid %d)\n", proc->pid);
+		if (bp->flags & BINDER_BUFFER_FLAG_HAS_PARENT) {
+			struct binder_buffer_object *parent = NULL;
+
+			for (j = 0; j < count; j++) {
+				if (offsets[j] == bp->parent) {
+					parent = (struct binder_buffer_object *)
+					    (buffer->kdata + offsets[j]);
+					break;
+				}
+			}
+			if (parent == NULL) {
+				printf("devfs: binder: nested buffer parent "
+				    "not found (pid %d)\n", proc->pid);
 				error = EINVAL;
 				break;
 			}
-			if (bp->length > extra_size || sg_used + need > BINDER_ALIGN(extra_size)) {
+			if (bp->buffer < parent->buffer ||
+			    bp->buffer + bp->length > parent->buffer + parent->length) {
+				printf("devfs: binder: nested buffer outside "
+				    "parent (pid %d)\n", proc->pid);
 				error = EINVAL;
 				break;
 			}
-			if (copyin((user_addr_t)bp->buffer,
-			    (char *)buffer->kdata + sg_area + sg_used,
-			    (size_t)bp->length) != 0) {
-				error = EFAULT;
-				break;
-			}
-			bp->buffer = (binder_uintptr_t)(binder_buffer_uaddr(target_proc,
-			    buffer) + sg_area + sg_used);
-			sg_used += need;
+			src = (void *)(uintptr_t)bp->buffer;
+			src_len = bp->length;
+		} else {
+			src = (void *)(uintptr_t)bp->buffer;
+			src_len = bp->length;
+		}
+
+		if (src_len > extra_size || sg_used + need > BINDER_ALIGN(extra_size)) {
+			error = EINVAL;
 			break;
 		}
+		if (copyin((user_addr_t)src,
+		    (char *)buffer->kdata + sg_area + sg_used,
+		    (size_t)src_len) != 0) {
+			error = EFAULT;
+			break;
+		}
+		bp->buffer = (binder_uintptr_t)(binder_buffer_uaddr(target_proc,
+		    buffer) + sg_area + sg_used);
+		sg_used += need;
+		break;
+	}
 		case BINDER_TYPE_FDA:
 			/*
 			 * An array of descriptors. The kernel cannot move descriptors

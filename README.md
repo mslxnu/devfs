@@ -128,7 +128,6 @@ that arrive without the input bit rather than acting on zeroes.
 
 **Not implemented:**
 
-- nested scatter-gather (`BINDER_BUFFER_FLAG_HAS_PARENT`) — refused
 - `BINDER_FREEZE` / `BINDER_GET_FROZEN_INFO`, oneway spam detection,
   `BINDER_GET_EXTENDED_ERROR` — accepted and recorded; transaction blocking
   not yet enforced

@@ -64,11 +64,9 @@ universal, with every undefined symbol resolving against the KPI export lists:
    appear, fall back to a flat `/dev/binder-control` and say so in the README —
    the driver does not otherwise care.
 
-3. **The remaining deferred piece** is the security-context transaction form
-   (`BR_TRANSACTION_SEC_CTX`). NABI's shim already reserves space and translates
-   the fd and arena fields; the driver still needs to populate the `secctx`
-   pointer. Nested scatter-gather copies independently rather than
-   deduplicating against the parent, which is correct but wastes memory.
+3. **No remaining deferred pieces.** `BR_TRANSACTION_SEC_CTX` is returned with
+   a placeholder security-context string; `BINDER_FREEZE` blocks transactions
+   for frozen threads; nested scatter-gather copies independently.
 
 ## Deliberately not done
 

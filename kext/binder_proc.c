@@ -744,11 +744,13 @@ binder_read_transaction(struct binder_proc *proc, struct binder_thread *thread,
     struct binder_transaction *t, user_addr_t buffer, uint64_t size,
     uint64_t *consumed)
 {
-	struct binder_transaction_data tr;
+	struct binder_transaction_data_secctx tr_secctx;
 	struct binder_buffer *buf = t->buffer;
 	user_addr_t uaddr;
 	uint32_t cmd;
 	int ret;
+	const char *secctx_str = "u:r:untrusted_app:s0";
+	size_t secctx_len = strlen(secctx_str) + 1;
 
 	if (buf == NULL) {
 		return EINVAL;
@@ -775,25 +777,37 @@ binder_read_transaction(struct binder_proc *proc, struct binder_thread *thread,
 		return 0;
 	}
 
-	bzero(&tr, sizeof(tr));
-	cmd = (buf->target_node != NULL) ? BR_TRANSACTION : BR_REPLY;
+	bzero(&tr_secctx, sizeof(tr_secctx));
+	cmd = BR_TRANSACTION_SEC_CTX;
 	if (buf->target_node != NULL) {
-		tr.target.ptr = buf->target_node->ptr;
-		tr.cookie = buf->target_node->cookie;
+		tr_secctx.transaction_data.target.ptr = buf->target_node->ptr;
+		tr_secctx.transaction_data.cookie = buf->target_node->cookie;
 	}
-	tr.code = t->code;
-	tr.flags = t->flags;
-	tr.sender_pid = (t->from != NULL) ? t->sender_pid : 0;
-	tr.sender_euid = t->sender_euid;
-	tr.data_size = buf->data_size;
-	tr.offsets_size = buf->offsets_size;
-	tr.data.ptr.buffer = (binder_uintptr_t)uaddr;
-	tr.data.ptr.offsets = (binder_uintptr_t)(uaddr + BINDER_ALIGN(buf->data_size));
+	tr_secctx.transaction_data.code = t->code;
+	tr_secctx.transaction_data.flags = t->flags;
+	tr_secctx.transaction_data.sender_pid = (t->from != NULL) ? t->sender_pid : 0;
+	tr_secctx.transaction_data.sender_euid = t->sender_euid;
+	tr_secctx.transaction_data.data_size = buf->data_size;
+	tr_secctx.transaction_data.offsets_size = buf->offsets_size;
+	tr_secctx.transaction_data.data.ptr.buffer = (binder_uintptr_t)uaddr;
+	tr_secctx.transaction_data.data.ptr.offsets = (binder_uintptr_t)(uaddr + BINDER_ALIGN(buf->data_size));
 
-	ret = binder_put_cmd_data(buffer, size, consumed, cmd, &tr, sizeof(tr));
+	tr_secctx.secctx = (binder_uintptr_t)(buffer + *consumed +
+	    sizeof(uint32_t) + sizeof(tr_secctx));
+
+	ret = binder_put_cmd_data(buffer, size, consumed, cmd,
+	    &tr_secctx, sizeof(tr_secctx));
 	if (ret != 0) {
 		return ret;
 	}
+
+	if (size - *consumed < secctx_len) {
+		return ENOMEM;
+	}
+	if (copyout(secctx_str, buffer + *consumed, secctx_len) != 0) {
+		return EFAULT;
+	}
+	*consumed += secctx_len;
 
 	/* From here the client owns the buffer until it says BC_FREE_BUFFER. */
 	buf->allow_user_free = true;

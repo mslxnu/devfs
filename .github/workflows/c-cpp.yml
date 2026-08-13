@@ -13,12 +13,6 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
-    # Fetch only the submodules the build actually needs:
-    #   libkext                    - the kernel library lib/Makefile builds
-    #
-    # Deliberately excluded: lib/xnu is huge and unused at build time (the tree
-    # ships the needed headers under include/xnu), MacKernelSDK uses an SSH URL
-    # that CI cannot authenticate.
     - name: Check out the build submodules
       run: |
         git submodule update --init \

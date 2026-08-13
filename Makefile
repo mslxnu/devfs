@@ -143,9 +143,35 @@ load: kextfs
 	sudo kmutil showloaded | grep devfs || true
 	sudo rm -rf /tmp/devfs.kext
 
+# Errors are reported rather than swallowed: an unload that quietly fails
+# leaves the old build resident, and the `load` below then succeeds against
+# it without replacing anything, so a fix appears not to work.
 unload:
-	sudo kmutil unload -b $(BUNDLE_ID) 2>/dev/null || true
+	-sudo kmutil unload -b $(BUNDLE_ID)
 	sudo kmutil clear-staging 2>/dev/null || true
+
+# Unload, load, and PROVE the running kext is the one just built. kmutil load
+# silently succeeds when a bundle of the same id and version is already
+# resident, so "did it actually reload?" is not a question worth answering by
+# eye - it costs a debugging session every time the answer is no.
+reload: kextfs
+	-sudo kmutil unload -b $(BUNDLE_ID)
+	@if kmutil showloaded 2>/dev/null | grep -q '$(BUNDLE_ID)'; then \
+		echo "error: $(BUNDLE_ID) is still loaded - the unload failed."; \
+		echo "       Close anything holding /dev/binder and try again."; \
+		exit 1; \
+	fi
+	@$(MAKE) --no-print-directory load
+	@live=`kmutil showloaded 2>/dev/null | awk '/$(BUNDLE_ID)/ {print $$8}'`; \
+	if [ -z "$$live" ]; then \
+		echo "error: $(BUNDLE_ID) did not load."; exit 1; \
+	elif dwarfdump --uuid $(OUT)/devfs.kext/Contents/MacOS/devfs | grep -q "$$live"; then \
+		echo "devfs: running $$live, which is this build."; \
+	else \
+		echo "error: running $$live, which is NOT this build - a stale copy is"; \
+		echo "       still resident. Try: sudo kmutil clear-staging; reboot."; \
+		exit 1; \
+	fi
 
 # The functional test, against a live load. Skips rather than fails when the
 # kext is not loaded, so CI stays a compile gate (the same shape as the procfs
@@ -191,4 +217,4 @@ clean:
 	$(MAKE) -C tools clean || true
 	rm -rf $(OUT)
 
-.PHONY: all kextfs load unload check install uninstall clean
+.PHONY: all kextfs load unload reload check install uninstall clean

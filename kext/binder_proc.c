@@ -46,36 +46,46 @@
 #pragma mark -
 #pragma mark Queues
 
+static void
+binder_queue_insert(struct binder_work_head *q, struct binder_work *work, bool head)
+{
+	if (work->queue != NULL) {
+		return;         /* already waiting somewhere; leave it there */
+	}
+	if (head) {
+		TAILQ_INSERT_HEAD(q, work, entry);
+	} else {
+		TAILQ_INSERT_TAIL(q, work, entry);
+	}
+	work->queue = q;
+}
+
 void
 binder_enqueue_work(struct binder_proc *proc, struct binder_work *work)
 {
-	if (work->queued) {
-		return;
-	}
-	TAILQ_INSERT_TAIL(&proc->todo, work, entry);
-	work->queued = true;
+	binder_queue_insert(&proc->todo, work, false);
 }
 
 void
 binder_enqueue_thread_work(struct binder_thread *thread, struct binder_work *work)
 {
-	if (work->queued) {
-		return;
-	}
-	TAILQ_INSERT_TAIL(&thread->todo, work, entry);
-	work->queued = true;
+	binder_queue_insert(&thread->todo, work, false);
 }
 
 /*
- * Take a work item off whichever queue holds it. The queue is not recorded
- * in the item, so the caller removes it from the list it knows about; this
- * is the path for items that must be withdrawn (a death notification whose
- * reference is going away, say) rather than consumed.
+ * Take a work item off whichever queue holds it, wherever that is. Every
+ * removal goes through here - including the ones that are about to free the
+ * item - because an item freed while still linked corrupts the list it was
+ * on, and the driver notices only when something later walks it.
  */
 void
 binder_dequeue_work(struct binder_work *work)
 {
-	work->queued = false;
+	if (work->queue == NULL) {
+		return;
+	}
+	TAILQ_REMOVE(work->queue, work, entry);
+	work->queue = NULL;
 }
 
 /*
@@ -209,6 +219,17 @@ binder_thread_release(struct binder_proc *proc, struct binder_thread *thread)
 		} else if (t->to_thread == thread) {
 			next = t->to_parent;
 			t->to_thread = NULL;
+			/*
+			 * The payload was allocated in this process's arena and
+			 * that arena is going away, so it is released here rather
+			 * than left for the sender to free a buffer that no longer
+			 * exists.
+			 */
+			if (t->buffer != NULL) {
+				binder_transaction_buffer_release(proc, t->buffer);
+				binder_buffer_free(proc, t->buffer);
+				t->buffer = NULL;
+			}
 			if (t->from != NULL && !t->from->is_dead) {
 				t->from->return_error.cmd = BR_DEAD_REPLY;
 				t->from->return_error.work.type = BINDER_WORK_RETURN_ERROR;
@@ -224,8 +245,7 @@ binder_thread_release(struct binder_proc *proc, struct binder_thread *thread)
 	thread->transaction_stack = NULL;
 
 	TAILQ_FOREACH_SAFE(w, &thread->todo, entry, tmp) {
-		TAILQ_REMOVE(&thread->todo, w, entry);
-		w->queued = false;
+		binder_dequeue_work(w);
 		if (w->type == BINDER_WORK_TRANSACTION) {
 			struct binder_transaction *tr =
 			    BINDER_CONTAINER_OF(w, struct binder_transaction, work);
@@ -294,6 +314,30 @@ binder_proc_release(struct binder_proc *proc)
 
 	proc->is_dead = true;
 
+	/*
+	 * Give up the context manager role first, while the node still knows
+	 * which process owned it: binder_node_died() below clears node->proc,
+	 * and a check made after that can never recognise its own manager -
+	 * which left the role held by a dead process for the life of the
+	 * kext, so the next servicemanager to start got EBUSY forever.
+	 *
+	 * The two self-references taken in binder_context_mgr_set() go with
+	 * it. They exist to keep the node alive while the role is held, so
+	 * releasing the role has to release them too or the node outlives
+	 * every reason to exist. Linux clears the same field on the same
+	 * path, in binder_deferred_release().
+	 */
+	if (proc->context != NULL && proc->context->mgr_node != NULL &&
+	    proc->context->mgr_node->proc == proc) {
+		struct binder_node *mgr = proc->context->mgr_node;
+
+		proc->context->mgr_node = NULL;
+		mgr->local_strong_refs = 0;
+		mgr->local_weak_refs = 0;
+		mgr->has_strong_ref = false;
+		mgr->has_weak_ref = false;
+	}
+
 	/* Objects this process implemented are now dead; anybody holding a
 	 * handle with a death notification hears about it here. */
 	LIST_FOREACH_SAFE(node, &proc->nodes, proc_entry, tnode) {
@@ -311,8 +355,7 @@ binder_proc_release(struct binder_proc *proc)
 	/* Work nobody will now collect. Transactions still owe their senders
 	 * an answer. */
 	TAILQ_FOREACH_SAFE(w, &proc->todo, entry, tw) {
-		TAILQ_REMOVE(&proc->todo, w, entry);
-		w->queued = false;
+		binder_dequeue_work(w);
 		switch (w->type) {
 		case BINDER_WORK_TRANSACTION: {
 			struct binder_transaction *t =
@@ -343,11 +386,6 @@ binder_proc_release(struct binder_proc *proc)
 	LIST_FOREACH_SAFE(thread, &proc->threads, entry, tthread) {
 		binder_wakeup_thread(thread);
 		binder_thread_release(proc, thread);
-	}
-
-	if (proc->context != NULL && proc->context->mgr_node != NULL &&
-	    proc->context->mgr_node->proc == proc) {
-		proc->context->mgr_node = NULL;
 	}
 
 	binder_arena_teardown(proc);
@@ -462,8 +500,7 @@ binder_write_free_buffer(struct binder_proc *proc, binder_uintptr_t data_ptr)
 		struct binder_work *next = TAILQ_FIRST(&node->async_todo);
 
 		if (next != NULL) {
-			TAILQ_REMOVE(&node->async_todo, next, entry);
-			next->queued = false;
+			binder_dequeue_work(next);
 			binder_enqueue_work(proc, next);
 			binder_wakeup_proc(proc);
 		} else {
@@ -791,11 +828,11 @@ binder_thread_read(struct binder_proc *proc, struct binder_thread *thread,
 
 		if (!TAILQ_EMPTY(&thread->todo)) {
 			w = TAILQ_FIRST(&thread->todo);
-			TAILQ_REMOVE(&thread->todo, w, entry);
+			binder_dequeue_work(w);
 		} else if (binder_thread_takes_proc_work(thread) &&
 		    !TAILQ_EMPTY(&proc->todo)) {
 			w = TAILQ_FIRST(&proc->todo);
-			TAILQ_REMOVE(&proc->todo, w, entry);
+			binder_dequeue_work(w);
 			from_proc = true;
 		}
 
@@ -829,8 +866,6 @@ binder_thread_read(struct binder_proc *proc, struct binder_thread *thread,
 			}
 			continue;
 		}
-
-		w->queued = false;
 
 		switch (w->type) {
 		case BINDER_WORK_TRANSACTION: {
@@ -898,12 +933,8 @@ binder_thread_read(struct binder_proc *proc, struct binder_thread *thread,
 			 * queue it came from - dropping it would lose a transaction
 			 * outright - and let the next read collect it.
 			 */
-			w->queued = true;
-			if (from_proc) {
-				TAILQ_INSERT_HEAD(&proc->todo, w, entry);
-			} else {
-				TAILQ_INSERT_HEAD(&thread->todo, w, entry);
-			}
+			binder_queue_insert(from_proc ? &proc->todo : &thread->todo,
+			    w, true);
 			ret = 0;
 			break;
 		}

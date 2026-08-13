@@ -36,16 +36,62 @@
 #include <stdint.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <time.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/event.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/select.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #define ARENA_SIZE (256u * 1024u)
 
 static int g_pass, g_fail;
+static FILE *g_log;
+
+/*
+ * Everything printed is also appended to a log that is flushed and fsynced
+ * line by line, because the failure this tool exists to survive is the
+ * machine stopping. Terminal output can be lost with the session; a synced
+ * file names the last thing that was attempted, which after a reboot is the
+ * difference between "it hung somewhere" and one code path.
+ */
+static void
+logline(const char *prefix, const char *fmt, va_list ap)
+{
+	va_list ap2;
+
+	va_copy(ap2, ap);
+	printf("%s", prefix);
+	vprintf(fmt, ap);
+	printf("\n");
+	fflush(stdout);
+
+	if (g_log != NULL) {
+		fprintf(g_log, "%s", prefix);
+		vfprintf(g_log, fmt, ap2);
+		fprintf(g_log, "\n");
+		fflush(g_log);
+		fsync(fileno(g_log));
+	}
+	va_end(ap2);
+}
+
+/*
+ * A breadcrumb dropped BEFORE something that might not return. If the log
+ * ends with one of these, that operation is where it stopped.
+ */
+static void
+trace(const char *fmt, ...)
+{
+	va_list ap;
+
+	va_start(ap, fmt);
+	logline("  ..   ", fmt, ap);
+	va_end(ap);
+}
 
 static void
 ok(bool cond, const char *fmt, ...)
@@ -54,15 +100,44 @@ ok(bool cond, const char *fmt, ...)
 
 	if (cond) {
 		g_pass++;
-		printf("  ok   ");
 	} else {
 		g_fail++;
-		printf("  FAIL ");
 	}
 	va_start(ap, fmt);
-	vprintf(fmt, ap);
+	logline(cond ? "  ok   " : "  FAIL ", fmt, ap);
 	va_end(ap);
-	printf("\n");
+}
+
+/*
+ * The error text for a call that has already returned. Reading errno as a
+ * sibling argument of the call that sets it - ok(f() == 0, "%s",
+ * strerror(errno)) - is unspecified: clang evaluates the varargs first, so
+ * the reported error is the one from before the call. That is how a passing
+ * check came to print "Undefined error: 0".
+ */
+static const char *
+lasterr(int r)
+{
+	static char buf[128];
+
+	if (r == 0) {
+		buf[0] = '\0';
+	} else {
+		snprintf(buf, sizeof(buf), " (%s)", strerror(errno));
+	}
+	return buf;
+}
+
+static void
+stage_banner(const char *name)
+{
+	printf("%s\n", name);
+	fflush(stdout);
+	if (g_log != NULL) {
+		fprintf(g_log, "== %s\n", name);
+		fflush(g_log);
+		fsync(fileno(g_log));
+	}
 }
 
 /* Every binder ioctl goes out with both direction bits set; see binder.h. */
@@ -217,7 +292,7 @@ test_version(void)
 	uint32_t abi = 0;
 	int fd;
 
-	printf("version\n");
+	stage_banner("version");
 	fd = open("/dev/binder", O_RDWR | O_CLOEXEC);
 	ok(fd >= 0, "/dev/binder opens (%s)", fd >= 0 ? "ok" : strerror(errno));
 	if (fd < 0) {
@@ -249,7 +324,7 @@ test_arena(void)
 	struct binder_msl_arena a;
 	int fd;
 
-	printf("arena\n");
+	stage_banner("arena");
 	fd = open("/dev/binder", O_RDWR | O_CLOEXEC);
 	if (fd < 0) {
 		ok(false, "open");
@@ -280,7 +355,7 @@ test_context_manager(void)
 	struct binder_conn a = { -1, NULL }, b = { -1, NULL };
 	int32_t zero = 0;
 
-	printf("context manager\n");
+	stage_banner("context manager");
 	if (!binder_connect(&a, "/dev/binder")) {
 		ok(false, "connect");
 		return;
@@ -321,8 +396,9 @@ test_oneway_self(void)
 	size_t woff = 0;
 	uint32_t cmd;
 	int32_t zero = 0;
+	int r;
 
-	printf("oneway self-transaction\n");
+	stage_banner("oneway self-transaction");
 	if (!binder_connect(&c, "/dev/binder")) {
 		ok(false, "connect");
 		return;
@@ -339,8 +415,8 @@ test_oneway_self(void)
 	memcpy(wbuf + woff, &zero, 4); woff += 4;
 	cmd = BC_ENTER_LOOPER;
 	memcpy(wbuf + woff, &cmd, 4); woff += 4;
-	ok(binder_wr(c.fd, wbuf, woff, NULL, 0, NULL) == 0,
-	    "BC_ACQUIRE on handle 0 (%s)", strerror(errno));
+	r = binder_wr(c.fd, wbuf, woff, NULL, 0, NULL);
+	ok(r == 0, "BC_ACQUIRE on handle 0%s", lasterr(r));
 
 	memset(&tr, 0, sizeof(tr));
 	tr.target.handle = 0;
@@ -356,8 +432,9 @@ test_oneway_self(void)
 	memcpy(wbuf + woff, &cmd, 4); woff += 4;
 	memcpy(wbuf + woff, &tr, sizeof(tr)); woff += sizeof(tr);
 
-	ok(binder_wr(c.fd, wbuf, woff, rbuf, sizeof(rbuf), &consumed) == 0,
-	    "BC_TRANSACTION accepted (%s)", strerror(errno));
+	trace("sending BC_TRANSACTION (oneway) and reading back");
+	r = binder_wr(c.fd, wbuf, woff, rbuf, sizeof(rbuf), &consumed);
+	ok(r == 0, "BC_TRANSACTION accepted%s", lasterr(r));
 
 	memset(&scan, 0, sizeof(scan));
 	scan.want = BR_TRANSACTION;
@@ -386,12 +463,13 @@ test_oneway_self(void)
 		ok(scan.tr.sender_pid == getpid() || scan.tr.sender_pid == 0,
 		    "the sender pid is recorded (%d)", scan.tr.sender_pid);
 
+		trace("freeing the delivered buffer");
 		woff = 0;
 		cmd = BC_FREE_BUFFER;
 		memcpy(wbuf + woff, &cmd, 4); woff += 4;
 		memcpy(wbuf + woff, &scan.tr.data.ptr.buffer, 8); woff += 8;
-		ok(binder_wr(c.fd, wbuf, woff, NULL, 0, NULL) == 0,
-		    "BC_FREE_BUFFER accepted (%s)", strerror(errno));
+		r = binder_wr(c.fd, wbuf, woff, NULL, 0, NULL);
+		ok(r == 0, "BC_FREE_BUFFER accepted%s", lasterr(r));
 
 		/* Freeing it twice is a protocol error, and is caught. */
 		ok(binder_wr(c.fd, wbuf, woff, NULL, 0, NULL) < 0,
@@ -478,9 +556,9 @@ test_request_reply(void)
 	size_t woff = 0;
 	uint32_t cmd;
 	int32_t zero = 0;
-	int spin;
+	int spin, r;
 
-	printf("request and reply\n");
+	stage_banner("request and reply");
 	if (!binder_connect(&c, "/dev/binder")) {
 		ok(false, "connect");
 		return;
@@ -520,9 +598,10 @@ test_request_reply(void)
 	memcpy(wbuf + woff, &cmd, 4); woff += 4;
 	memcpy(wbuf + woff, &tr, sizeof(tr)); woff += sizeof(tr);
 
+	trace("sending the synchronous transaction (this blocks until the reply)");
 	consumed = 0;
-	ok(binder_wr(c.fd, wbuf, woff, rbuf, sizeof(rbuf), &consumed) == 0,
-	    "the synchronous transaction was sent (%s)", strerror(errno));
+	r = binder_wr(c.fd, wbuf, woff, rbuf, sizeof(rbuf), &consumed);
+	ok(r == 0, "the synchronous transaction was sent%s", lasterr(r));
 
 	memset(&scan, 0, sizeof(scan));
 	scan.want = BR_REPLY;
@@ -552,62 +631,123 @@ test_request_reply(void)
 	}
 	ok(sa.served == 1, "the serving thread handled exactly one call");
 
+	trace("joining the serving thread");
 	pthread_join(tid, NULL);
+	trace("closing the binder fd (proc teardown)");
 	binder_disconnect(&c);
 }
 
+/*
+ * Readiness, and the platform limitation behind it.
+ *
+ * The driver reports readiness through d_select, which is what select(2)
+ * asks. poll(2) on macOS does not ask it: it is implemented over kqueue,
+ * and filt_specattach refuses a knote on a third-party character device
+ * unless the driver has called cdevsw_setkqueueok() - which is not in the
+ * SDK and is exported only through com.apple.kpi.private, a KPI the sibling
+ * modules deliberately do not link. So poll() answers POLLNVAL here, having
+ * never reached this driver at all.
+ *
+ * The escape hatch is in that same check: a knote carrying NOTE_LOWAT with
+ * a low-water mark of 1 is accepted. kqueue therefore works, which is what
+ * matters in practice - Android's looper uses epoll, and mSL/NABI
+ * implements epoll over kqueue, so its binder shim sets NOTE_LOWAT and gets
+ * exactly the readiness this driver reports.
+ *
+ * All four behaviours are asserted, including the two that are failures of
+ * the platform rather than of the driver, so that a kernel which one day
+ * fixes them is noticed rather than silently relied upon.
+ */
 static void
 test_poll(void)
 {
 	struct binder_conn c = { -1, NULL };
+	struct binder_transaction_data tr;
 	struct pollfd pfd;
+	struct kevent kev;
+	struct timespec ts = { 0, 200 * 1000 * 1000 };
+	struct timeval tv;
+	fd_set rfds;
+	uint8_t wbuf[128];
+	uint8_t payload[8] = "poll";
+	uint32_t cmd;
+	size_t woff = 0;
 	int32_t zero = 0;
-	int r;
+	int kq, r;
 
-	printf("poll\n");
+	stage_banner("poll");
 	if (!binder_connect(&c, "/dev/binder")) {
 		ok(false, "connect");
 		return;
 	}
+
+	FD_ZERO(&rfds);
+	FD_SET(c.fd, &rfds);
+	tv.tv_sec = 0;
+	tv.tv_usec = 0;
+	r = select(c.fd + 1, &rfds, NULL, NULL, &tv);
+	ok(r == 0, "select() says an idle binder fd is not readable");
+
 	pfd.fd = c.fd;
 	pfd.events = POLLIN;
 	pfd.revents = 0;
 	r = poll(&pfd, 1, 0);
-	ok(r == 0 || (pfd.revents & POLLIN) == 0,
-	    "an idle binder fd is not readable");
+	ok(r == 1 && (pfd.revents & POLLNVAL) != 0,
+	    "poll() answers POLLNVAL - it never reaches the driver (see above)");
 
-	if (bioctl(c.fd, BINDER_SET_CONTEXT_MGR, &zero) == 0) {
-		uint8_t wbuf[128];
-		struct binder_transaction_data tr;
-		uint8_t payload[8] = "poll";
-		uint32_t cmd;
-		size_t woff = 0;
+	kq = kqueue();
+	EV_SET(&kev, c.fd, EVFILT_READ, EV_ADD, 0, 0, NULL);
+	r = kevent(kq, &kev, 1, NULL, 0, NULL);
+	ok(r < 0 && errno == EINVAL,
+	    "a plain EVFILT_READ knote is refused, as filt_specattach requires");
 
-		cmd = BC_ACQUIRE;
-		memcpy(wbuf + woff, &cmd, 4); woff += 4;
-		memcpy(wbuf + woff, &zero, 4); woff += 4;
-		cmd = BC_ENTER_LOOPER;
-		memcpy(wbuf + woff, &cmd, 4); woff += 4;
-		binder_wr(c.fd, wbuf, woff, NULL, 0, NULL);
+	EV_SET(&kev, c.fd, EVFILT_READ, EV_ADD, NOTE_LOWAT, 1, NULL);
+	r = kevent(kq, &kev, 1, NULL, 0, NULL);
+	ok(r == 0, "EVFILT_READ with NOTE_LOWAT=1 registers%s", lasterr(r));
 
-		memset(&tr, 0, sizeof(tr));
-		tr.target.handle = 0;
-		tr.code = 7;
-		tr.flags = TF_ONE_WAY;
-		tr.data_size = sizeof(payload);
-		tr.data.ptr.buffer = (binder_uintptr_t)(uintptr_t)payload;
-
-		woff = 0;
-		cmd = BC_TRANSACTION;
-		memcpy(wbuf + woff, &cmd, 4); woff += 4;
-		memcpy(wbuf + woff, &tr, sizeof(tr)); woff += sizeof(tr);
-		binder_wr(c.fd, wbuf, woff, NULL, 0, NULL);
-
-		pfd.revents = 0;
-		r = poll(&pfd, 1, 500);
-		ok(r == 1 && (pfd.revents & POLLIN) != 0,
-		    "a pending transaction makes the fd readable");
+	if (bioctl(c.fd, BINDER_SET_CONTEXT_MGR, &zero) < 0) {
+		ok(false, "become the context manager (%s)", strerror(errno));
+		close(kq);
+		binder_disconnect(&c);
+		return;
 	}
+
+	woff = 0;
+	cmd = BC_ACQUIRE;
+	memcpy(wbuf + woff, &cmd, 4); woff += 4;
+	memcpy(wbuf + woff, &zero, 4); woff += 4;
+	cmd = BC_ENTER_LOOPER;
+	memcpy(wbuf + woff, &cmd, 4); woff += 4;
+	binder_wr(c.fd, wbuf, woff, NULL, 0, NULL);
+
+	memset(&tr, 0, sizeof(tr));
+	tr.target.handle = 0;
+	tr.code = 7;
+	tr.flags = TF_ONE_WAY;
+	tr.data_size = sizeof(payload);
+	tr.data.ptr.buffer = (binder_uintptr_t)(uintptr_t)payload;
+
+	woff = 0;
+	cmd = BC_TRANSACTION;
+	memcpy(wbuf + woff, &cmd, 4); woff += 4;
+	memcpy(wbuf + woff, &tr, sizeof(tr)); woff += sizeof(tr);
+	trace("queueing a transaction, then asking whether the fd is readable");
+	binder_wr(c.fd, wbuf, woff, NULL, 0, NULL);
+
+	FD_ZERO(&rfds);
+	FD_SET(c.fd, &rfds);
+	tv.tv_sec = 0;
+	tv.tv_usec = 500 * 1000;
+	r = select(c.fd + 1, &rfds, NULL, NULL, &tv);
+	ok(r == 1 && FD_ISSET(c.fd, &rfds),
+	    "select() says a pending transaction makes the fd readable");
+
+	memset(&kev, 0, sizeof(kev));
+	r = kevent(kq, NULL, 0, &kev, 1, &ts);
+	ok(r == 1 && kev.filter == EVFILT_READ,
+	    "kqueue reports the same work (data %lld)", (long long)kev.data);
+
+	close(kq);
 	binder_disconnect(&c);
 }
 
@@ -615,33 +755,85 @@ test_poll(void)
  * Two processes: one holds an object, the other receives it as a handle
  * and asks to be told when it dies. This is the path everything real uses,
  * and the only one that proves translation across a process boundary.
+ *
+ * The synchronisation is deliberately careful, because the first version
+ * was not and it cost a diagnosis. It used one pipe in both directions with
+ * both ends open in both processes, so a child that failed early left the
+ * parent blocked in read() forever - no EOF, no output, and the child's
+ * actual complaint lost. Now there are two pipes, each with the unused end
+ * closed on each side, so a child that dies is an EOF rather than a hang;
+ * the parent waits with a timeout regardless; and the child reports why it
+ * gave up instead of exiting with a bare number.
  */
+
+/* What the child reports back, in its exit status. */
+#define KID_OK             0
+#define KID_NO_CONNECT     2
+#define KID_NO_ACQUIRE     3
+#define KID_NO_DEATH       4
+
+static const char *
+kid_reason(int code)
+{
+	switch (code) {
+	case KID_OK:          return "it saw BR_DEAD_BINDER with its own cookie";
+	case KID_NO_CONNECT:  return "it could not open and register an arena";
+	case KID_NO_ACQUIRE:  return "BC_ACQUIRE / BC_REQUEST_DEATH_NOTIFICATION failed";
+	case KID_NO_DEATH:    return "no BR_DEAD_BINDER arrived before it gave up";
+	default:              return "it died unexpectedly";
+	}
+}
+
+/* Wait for one byte, or give up. Returns 1 on data, 0 on EOF, -1 on timeout. */
+static int
+wait_for_byte(int fd, int ms)
+{
+	struct pollfd pfd;
+	char b;
+	int r;
+
+	pfd.fd = fd;
+	pfd.events = POLLIN;
+	pfd.revents = 0;
+
+	r = poll(&pfd, 1, ms);
+	if (r == 0) {
+		return -1;
+	}
+	if (r < 0) {
+		return -1;
+	}
+	r = (int)read(fd, &b, 1);
+	return r > 0 ? 1 : 0;
+}
+
 static void
 test_two_process(void)
 {
 	struct binder_conn srv = { -1, NULL };
-	int sync_pipe[2];
+	int ready[2], go[2];
 	pid_t child;
+	int32_t zero = 0;
+	int status = 0;
+	int ready_state;
 
-	printf("two processes\n");
-	if (pipe(sync_pipe) != 0) {
-		ok(false, "pipe");
+	stage_banner("two processes");
+
+	if (pipe(ready) != 0 || pipe(go) != 0) {
+		ok(false, "create the synchronisation pipes");
 		return;
 	}
 	if (!binder_connect(&srv, "/dev/binder")) {
-		ok(false, "connect");
+		ok(false, "the owner connects");
 		return;
 	}
-	{
-		int32_t zero = 0;
-
-		if (bioctl(srv.fd, BINDER_SET_CONTEXT_MGR, &zero) < 0) {
-			ok(false, "become the context manager (%s)", strerror(errno));
-			binder_disconnect(&srv);
-			return;
-		}
+	if (bioctl(srv.fd, BINDER_SET_CONTEXT_MGR, &zero) < 0) {
+		ok(false, "the owner becomes the context manager (%s)", strerror(errno));
+		binder_disconnect(&srv);
+		return;
 	}
 
+	trace("forking the client");
 	child = fork();
 	if (child < 0) {
 		ok(false, "fork");
@@ -650,7 +842,6 @@ test_two_process(void)
 	}
 
 	if (child == 0) {
-		/* Client: acquire handle 0, ask to hear about its death, wait. */
 		struct binder_conn cli = { -1, NULL };
 		uint8_t wbuf[256], rbuf[512];
 		struct binder_handle_cookie hc;
@@ -658,16 +849,24 @@ test_two_process(void)
 		uint64_t consumed = 0;
 		uint32_t cmd;
 		size_t woff = 0;
-		int rc = 1;
-		char go;
+		int spin, rc;
+		char discard;
+
+		/* The parent's descriptors are not ours to hold: the binder fd
+		 * came along with the fork, and the pipe ends we do not use
+		 * would stop the other side ever seeing an EOF. */
+		close(srv.fd);
+		close(ready[0]);
+		close(go[1]);
 
 		if (!binder_connect(&cli, "/dev/binder")) {
-			_exit(2);
+			_exit(KID_NO_CONNECT);
 		}
+
 		woff = 0;
 		cmd = BC_ACQUIRE;
 		memcpy(wbuf + woff, &cmd, 4); woff += 4;
-		memset(wbuf + woff, 0, 4); woff += 4;
+		memset(wbuf + woff, 0, 4); woff += 4;          /* handle 0 */
 		cmd = BC_ENTER_LOOPER;
 		memcpy(wbuf + woff, &cmd, 4); woff += 4;
 		cmd = BC_REQUEST_DEATH_NOTIFICATION;
@@ -675,17 +874,20 @@ test_two_process(void)
 		hc.handle = 0;
 		hc.cookie = 0xDEADBEEF;
 		memcpy(wbuf + woff, &hc, sizeof(hc)); woff += sizeof(hc);
+
 		if (binder_wr(cli.fd, wbuf, woff, NULL, 0, NULL) < 0) {
-			_exit(3);
+			_exit(KID_NO_ACQUIRE);
 		}
 
-		/* Tell the parent we are ready, then wait for it to die. */
-		write(sync_pipe[1], "g", 1);
-		read(sync_pipe[0], &go, 1);   /* blocks until the parent closes it */
+		/* Ready. The parent answers by closing its end, not by writing. */
+		if (write(ready[1], "g", 1) != 1) {
+			_exit(KID_NO_ACQUIRE);
+		}
+		(void)read(go[0], &discard, 1);
 
 		memset(&scan, 0, sizeof(scan));
 		scan.want = BR_DEAD_BINDER;
-		for (int spin = 0; spin < 200 && !scan.seen; spin++) {
+		for (spin = 0; spin < 200 && !scan.seen; spin++) {
 			consumed = 0;
 			if (binder_wr(cli.fd, NULL, 0, rbuf, sizeof(rbuf), &consumed) < 0 &&
 			    errno != EINTR) {
@@ -696,30 +898,129 @@ test_two_process(void)
 				usleep(10000);
 			}
 		}
-		rc = (scan.seen && scan.cookie == 0xDEADBEEF) ? 0 : 1;
+		rc = (scan.seen && scan.cookie == 0xDEADBEEF) ? KID_OK : KID_NO_DEATH;
 		binder_disconnect(&cli);
 		_exit(rc);
 	}
 
-	/* Server: wait for the client to be ready, then go away. */
-	{
-		char g;
-		int status = 0;
+	close(ready[1]);
+	close(go[0]);
 
-		ok(read(sync_pipe[0], &g, 1) == 1, "the client registered a handle");
-		binder_disconnect(&srv);     /* the object dies here */
-		close(sync_pipe[1]);         /* which the client learns from the pipe */
+	trace("waiting for the client to acquire a handle");
+	ready_state = wait_for_byte(ready[0], 10000);
+	ok(ready_state == 1, "the client acquired a handle and asked about its death%s",
+	    ready_state == 0 ? " (it exited first)" :
+	    ready_state < 0 ? " (it never answered)" : "");
 
-		waitpid(child, &status, 0);
-		ok(WIFEXITED(status) && WEXITSTATUS(status) == 0,
-		    "the client received BR_DEAD_BINDER with its own cookie");
+	if (ready_state == 1) {
+		trace("closing the owner's fd - its object dies here");
+		binder_disconnect(&srv);
+	} else {
+		binder_disconnect(&srv);
 	}
-	close(sync_pipe[0]);
+	close(go[1]);          /* release the client, however it went */
+
+	trace("waiting for the client to report");
+	waitpid(child, &status, 0);
+	close(ready[0]);
+
+	if (WIFEXITED(status)) {
+		int code = WEXITSTATUS(status);
+
+		ok(code == KID_OK, "the client received BR_DEAD_BINDER (%s)",
+		    kid_reason(code));
+	} else {
+		ok(false, "the client died on a signal (%d)", WTERMSIG(status));
+	}
+}
+
+struct stage {
+	const char *name;
+	void (*fn)(void);
+	const char *what;
+};
+
+static const struct stage g_stages[] = {
+	{ "version", test_version,         "the devices exist and name their protocol" },
+	{ "arena",   test_arena,           "arena registration and its bounds" },
+	{ "manager", test_context_manager, "context manager registration, per context" },
+	{ "oneway",  test_oneway_self,     "a oneway transaction to ourselves" },
+	{ "sync",    test_request_reply,   "request and reply across two threads" },
+	{ "poll",    test_poll,            "readiness agreeing with the read loop" },
+	{ "twoproc", test_two_process,     "handle transfer and death, two processes" },
+};
+
+#define NSTAGES (int)(sizeof(g_stages) / sizeof(g_stages[0]))
+
+static void
+usage(void)
+{
+	int i;
+
+	printf("usage: binder-probe [--stage NAME]... [--list] [--log PATH]\n\n");
+	printf("Runs every stage when none is named. The stages are ordered:\n"
+	    "each assumes the ones before it work, so run them in order when\n"
+	    "walking up to a failure.\n\n");
+	for (i = 0; i < NSTAGES; i++) {
+		printf("  %-8s %s\n", g_stages[i].name, g_stages[i].what);
+	}
+	printf("\nEvery line is also appended to a log - out/binder-probe.log,\n"
+	    "or ./binder-probe.log - flushed and synced as it is written, so it\n"
+	    "survives the machine stopping. A log ending in a '..' line names\n"
+	    "the operation that did not return.\n");
+}
+
+static void
+log_open(const char *path)
+{
+	char fallback[] = "binder-probe.log";
+
+	if (path == NULL) {
+		path = access("out", F_OK) == 0 ? "out/binder-probe.log" : fallback;
+	}
+	g_log = fopen(path, "a");
+	if (g_log != NULL) {
+		time_t now = time(NULL);
+
+		fprintf(g_log, "\n=== binder-probe %s", ctime(&now));
+		fflush(g_log);
+	} else {
+		printf("  (could not open %s; output is not being logged)\n", path);
+	}
 }
 
 int
-main(void)
+main(int argc, char **argv)
 {
+	const char *chosen[NSTAGES];
+	const char *logpath = NULL;
+	int nchosen = 0;
+	int i, j;
+
+	for (i = 1; i < argc; i++) {
+		if (strcmp(argv[i], "--list") == 0 || strcmp(argv[i], "-h") == 0 ||
+		    strcmp(argv[i], "--help") == 0) {
+			usage();
+			return 0;
+		}
+		if (strcmp(argv[i], "--stage") == 0 && i + 1 < argc) {
+			if (nchosen < NSTAGES) {
+				chosen[nchosen++] = argv[++i];
+			}
+			continue;
+		}
+		if (strcmp(argv[i], "--log") == 0 && i + 1 < argc) {
+			logpath = argv[++i];
+			continue;
+		}
+		printf("unknown argument: %s\n\n", argv[i]);
+		usage();
+		return 2;
+	}
+
+	setvbuf(stdout, NULL, _IONBF, 0);
+	log_open(logpath);
+
 	printf("mSL/DevFS binder probe\n\n");
 
 	if (access("/dev/binder", F_OK) != 0) {
@@ -755,14 +1056,31 @@ main(void)
 		}
 	}
 
-	test_version();
-	test_arena();
-	test_context_manager();
-	test_oneway_self();
-	test_request_reply();
-	test_poll();
-	test_two_process();
+	if (nchosen == 0) {
+		for (i = 0; i < NSTAGES; i++) {
+			g_stages[i].fn();
+		}
+	} else {
+		for (j = 0; j < nchosen; j++) {
+			for (i = 0; i < NSTAGES; i++) {
+				if (strcmp(chosen[j], g_stages[i].name) == 0) {
+					g_stages[i].fn();
+					break;
+				}
+			}
+			if (i == NSTAGES) {
+				printf("unknown stage: %s (try --list)\n", chosen[j]);
+				return 2;
+			}
+		}
+	}
 
 	printf("\n%d passed, %d failed\n", g_pass, g_fail);
+	if (g_log != NULL) {
+		fprintf(g_log, "-- %d passed, %d failed\n", g_pass, g_fail);
+		fflush(g_log);
+		fsync(fileno(g_log));
+		fclose(g_log);
+	}
 	return g_fail == 0 ? 0 : 1;
 }

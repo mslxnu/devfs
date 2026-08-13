@@ -227,11 +227,34 @@ binder_translate_fd(struct binder_fd_object *fp, struct binder_proc *proc,
 #pragma mark -
 #pragma mark Transactions
 
+/*
+ * Release a transaction, having first removed every reference to it that
+ * would outlive it.
+ *
+ * A synchronous transaction is on two thread stacks at once - the caller's,
+ * which is waiting for the reply, and the server's, which owes it - and
+ * either can be the one that frees it. Popping only the stack the caller of
+ * this function happens to be holding leaves the other thread with a
+ * dangling pointer that is not dereferenced until its *next* transaction or
+ * its close, which is a long way from the cause. Both are popped here,
+ * where it cannot be forgotten, as Linux does in
+ * binder_pop_transaction_ilocked().
+ */
 void
 binder_free_transaction(struct binder_transaction *t)
 {
 	if (t == NULL) {
 		return;
+	}
+
+	/* Never free something still linked into a queue. */
+	binder_dequeue_work(&t->work);
+
+	if (t->from != NULL && t->from->transaction_stack == t) {
+		t->from->transaction_stack = t->from_parent;
+	}
+	if (t->to_thread != NULL && t->to_thread->transaction_stack == t) {
+		t->to_thread->transaction_stack = t->to_parent;
 	}
 	if (t->buffer != NULL) {
 		t->buffer->transaction = NULL;
@@ -538,7 +561,13 @@ binder_transaction(struct binder_proc *proc, struct binder_thread *thread,
 
 	t->debug_id = binder_next_debug_id();
 	t->work.type = BINDER_WORK_TRANSACTION;
-	t->from = oneway ? NULL : thread;
+	/*
+	 * Only a call that expects an answer records who sent it. A reply is
+	 * never replied to and an asynchronous transaction is never waited on,
+	 * so in both cases the pointer would only be a way for a thread that
+	 * exits first to leave a dangling reference behind it.
+	 */
+	t->from = (reply || oneway) ? NULL : thread;
 	t->to_proc = target_proc;
 	t->to_thread = target_thread;
 	t->code = tr->code;
@@ -579,7 +608,7 @@ binder_transaction(struct binder_proc *proc, struct binder_thread *thread,
 		 */
 		if (target_node->has_async_transaction) {
 			TAILQ_INSERT_TAIL(&target_node->async_todo, &t->work, entry);
-			t->work.queued = true;
+			t->work.queue = &target_node->async_todo;
 		} else {
 			target_node->has_async_transaction = true;
 			binder_enqueue_work(target_proc, &t->work);

@@ -126,13 +126,24 @@ binder_node_maybe_free(struct binder_node *node)
 	if (node->has_strong_ref || node->has_weak_ref) {
 		return;   /* the owner has not acknowledged the release yet */
 	}
-	if (node->work.queued) {
+	if (BINDER_WORK_QUEUED(&node->work)) {
 		return;   /* still queued as news for somebody */
 	}
 
+	/*
+	 * Asynchronous transactions still queued behind this object. Their
+	 * buffers belong to the process that is going away with it, so they
+	 * are unlinked and released rather than handed on; being oneway,
+	 * nobody is waiting on an answer.
+	 */
 	TAILQ_FOREACH_SAFE(w, &node->async_todo, entry, tmp) {
-		TAILQ_REMOVE(&node->async_todo, w, entry);
-		w->queued = false;
+		binder_dequeue_work(w);
+		if (w->type == BINDER_WORK_TRANSACTION) {
+			struct binder_transaction *t = (struct binder_transaction *)
+			    ((char *)w - __builtin_offsetof(struct binder_transaction, work));
+
+			binder_free_transaction(t);
+		}
 	}
 
 	if (node->proc != NULL) {
@@ -165,7 +176,7 @@ binder_node_notify_owner(struct binder_node *node, struct binder_thread *thread)
 	if (node->proc == NULL || node->proc->is_dead) {
 		return;
 	}
-	if (node->work.queued) {
+	if (BINDER_WORK_QUEUED(&node->work)) {
 		return;
 	}
 	if (thread != NULL && thread->proc == node->proc) {
@@ -247,7 +258,7 @@ binder_node_died(struct binder_node *node)
 		if (ref->death == NULL) {
 			continue;
 		}
-		if (ref->death->work.queued) {
+		if (BINDER_WORK_QUEUED(&ref->death->work)) {
 			continue;
 		}
 		ref->death->work.type = BINDER_WORK_DEAD_BINDER;
@@ -384,10 +395,23 @@ binder_ref_update(struct binder_ref *ref, bool strong, bool increment,
 	return ret;
 }
 
+/*
+ * Drop a handle, releasing whatever it was still holding.
+ *
+ * The counts matter as much as the link. A handle with a strong count owns
+ * one of the node's internal strong references, and binder_ref_update()
+ * gives that back on the 1 -> 0 transition - but a handle deleted outright,
+ * which is what process teardown does, never passes through that
+ * transition. Leaving the count behind means the node can never satisfy
+ * binder_node_maybe_free() and lives until the kext unloads; it showed up
+ * as devfs.binder_nodes sitting at three with no processes and no handles
+ * left to explain them.
+ */
 void
 binder_ref_delete(struct binder_ref *ref)
 {
 	struct binder_node *node = ref->node;
+	bool had_strong = ref->strong > 0;
 
 	if (ref->death != NULL) {
 		binder_dequeue_work(&ref->death->work);
@@ -401,9 +425,12 @@ binder_ref_delete(struct binder_ref *ref)
 	binder_stat_refs--;
 
 	if (node != NULL) {
-		/* The node may have been kept alive only by this handle. */
-		binder_node_update_refs(node, false, false, true, NULL);
-		binder_node_maybe_free(node);
+		/*
+		 * Exactly one call, whichever it is: binder_node_update_refs()
+		 * ends in binder_node_maybe_free(), so a second would be
+		 * operating on a node the first may have freed.
+		 */
+		binder_node_update_refs(node, had_strong, false, true, NULL);
 	}
 }
 
@@ -533,7 +560,7 @@ binder_death_clear(struct binder_proc *proc, struct binder_thread *thread,
 		return EINVAL;
 	}
 
-	if (!death->work.queued) {
+	if (!BINDER_WORK_QUEUED(&death->work)) {
 		death->work.type = BINDER_WORK_CLEAR_DEATH_NOTIFICATION;
 		binder_enqueue_thread_work(thread, &death->work);
 	} else {

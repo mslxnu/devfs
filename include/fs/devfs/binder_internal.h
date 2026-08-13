@@ -83,18 +83,30 @@ enum binder_work_type {
 	BINDER_WORK_CLEAR_DEATH_NOTIFICATION,
 };
 
+struct binder_work_head;
+
 /*
  * The unit of everything queued to a thread or a process. Embedded in the
  * object it describes rather than allocated beside it, so dequeuing is a
  * container_of and never an allocation that can fail.
+ *
+ * `queue` is the list this item is currently on, and it is the only record
+ * of that fact. An earlier version kept a boolean instead, which cost a
+ * frozen machine: clearing a flag does not unlink anything, so a death
+ * notification could be freed while still linked into a process's todo
+ * list, and the next walk of that list traversed freed memory with the
+ * driver lock held. Anything that takes an item off a queue goes through
+ * binder_dequeue_work().
  */
 struct binder_work {
 	TAILQ_ENTRY(binder_work) entry;
+	struct binder_work_head *queue;
 	enum binder_work_type type;
-	bool queued;
 };
 
 TAILQ_HEAD(binder_work_head, binder_work);
+
+#define BINDER_WORK_QUEUED(w) ((w)->queue != NULL)
 
 /* A BR_ERROR waiting to be handed to a thread. */
 struct binder_error {

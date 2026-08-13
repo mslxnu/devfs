@@ -142,6 +142,28 @@ ioctl(fd, BINDER_CMD_HOST(BINDER_MSL_SET_ARENA), &arena);
 The driver copies each payload into `host`; the guest reads it at `gaddr`,
 because they are the same pages. Record both so step 3 can convert between them.
 
+### 4b. Set NOTE_LOWAT when registering a binder fd with kqueue
+
+NABI implements epoll over kqueue, and a guest's looper will register the
+binder fd for readability. A plain `EVFILT_READ` knote on this device is
+refused with `EINVAL` — macOS will not attach one to a third-party character
+device whose driver has not called `cdevsw_setkqueueok()`, which is private
+KPI. The check that refuses it accepts a knote carrying `NOTE_LOWAT` with a
+low-water mark of 1:
+
+```c
+EV_SET(&kev, host_fd, EVFILT_READ, EV_ADD, NOTE_LOWAT, 1, udata);
+```
+
+With that, readiness is exact: the driver reports work through the same
+predicate its read loop uses, so a looper never spins and never sleeps through
+a pending transaction. Without it, `epoll_ctl(EPOLL_CTL_ADD)` fails and the
+guest concludes binder is broken.
+
+`select()` needs nothing special. `poll()` cannot be made to work at all from
+outside the kernel — it answers `POLLNVAL` — so a guest that polls the binder
+fd directly is a case the shim has to translate rather than pass through.
+
 ### 5. Do not let NABI's own signals surface as EINTR
 
 A thread parked in `BINDER_WRITE_READ` is interruptible by design. NABI takes

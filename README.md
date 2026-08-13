@@ -82,6 +82,17 @@ sender's descriptor number and the sender's pid (in a field Linux leaves as
 padding), for a userspace broker to resolve over `SCM_RIGHTS`. `BINDER_TYPE_FDA`
 is refused outright rather than delivered as numbers that mean nothing.
 
+**`poll()` cannot reach a third-party character device.** macOS implements
+`poll()` over kqueue, and `filt_specattach` refuses a knote on a cdev whose
+driver has not called `cdevsw_setkqueueok()` — which is absent from the SDK and
+exported only through `com.apple.kpi.private`, a KPI the sibling modules
+deliberately do not link. `poll()` therefore answers `POLLNVAL` without ever
+consulting the driver. `select()` works, and so does kqueue when the knote
+carries `NOTE_LOWAT` with a low-water mark of 1, which is the escape hatch in
+that same check. This is not academic: Android's looper watches the binder fd
+with epoll, mSL/NABI implements epoll over kqueue, so its shim sets
+`NOTE_LOWAT` and gets exactly the readiness this driver reports.
+
 **The ioctl direction bits are inverted.** BSD's `_IOW` is `IOC_IN`; Linux's is
 the other bit, and XNU acts on them before the driver is called — a
 Linux-numbered `_IOW` arrives as a buffer of zeroes. Clients send
@@ -108,7 +119,8 @@ that arrive without the input bit rather than acting on zeroes.
 - object translation across processes, including `BINDER_TYPE_PTR`
   scatter-gather buffers
 - asynchronous transactions, one at a time per object, with the rest queued on it
-- `poll()`/`select()` readiness that agrees with the read loop
+- readiness that agrees with the read loop, through `select()` and through
+  kqueue with `NOTE_LOWAT` (`poll()` is a platform limitation, above)
 - teardown on close: objects declared dead, handles dropped, callers waiting on
   a reply told `BR_DEAD_REPLY`
 - diagnostic counters under `sysctl devfs`
@@ -201,6 +213,21 @@ readable exactly when there is work; and an object passed to a second process
 arrives as a handle whose holder is told when its owner exits.
 
 `make check` skips cleanly when nothing is loaded, so CI stays a compile gate.
+
+The stages are independent and can be run one at a time, which is what you
+want while the driver is still young enough to hang the machine:
+
+```bash
+./out/binder-probe --list
+./out/binder-probe --stage oneway
+```
+
+Every line is also appended to `out/binder-probe.log`, flushed and `fsync`ed as
+it is written. That matters more than it sounds: a driver bug here stops the
+machine rather than the process, taking the terminal with it, and a synced log
+survives the reboot. A log whose last line begins `..` names the operation that
+never returned — the stage alone narrows a hang to a few hundred lines of
+kernel code, and that line narrows it to one.
 
 ## Credits
 

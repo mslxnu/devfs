@@ -129,8 +129,8 @@ that arrive without the input bit rather than acting on zeroes.
 **Not implemented:**
 
 - `BINDER_FREEZE` / `BINDER_GET_FROZEN_INFO`, oneway spam detection,
-  `BINDER_GET_EXTENDED_ERROR` — accepted and recorded; transaction blocking
-  not yet enforced
+  `BINDER_GET_EXTENDED_ERROR` — accepted and recorded; frozen threads
+  skip transactions in the read path
 - the security-context transaction form (`BR_TRANSACTION_SEC_CTX`)
 - `/dev/ashmem` — deliberately, see [doc/NABI-INTEGRATION.md](doc/NABI-INTEGRATION.md)
 - fine-grained locking: the driver holds one mutex, by choice, and says why in

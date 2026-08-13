@@ -1,6 +1,6 @@
 CC=     cc
-CFLAGS= -O2 -Wall -Wextra -std=c99 -g -fPIE -I../include
-PROGS=  binder-probe
+CFLAGS= -O2 -Wall -Wextra -std=gnu11 -g -fPIE -I../include
+PROGS=  binder-probe binder-abi-test
 
 all: $(PROGS)
 
@@ -12,3 +12,5 @@ clean:
 	rm -rf *.dSYM
 
 .PHONY: all clean
+binder-abi-test: binder-abi-test.c ../include/fs/devfs/binder.h
+	$(CC) $(CFLAGS) -o $@ $<

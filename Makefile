@@ -104,7 +104,9 @@ kextfs:
 	rm -rf $(OUT)/devfs.kext.arm64e $(OUT)/devfs.kext.x86_64
 	$(MAKE) -C tools
 	mv tools/binder-probe $(OUT)/
+	mv tools/binder-abi-test $(OUT)/
 	-mv tools/binder-probe.dSYM $(OUT)/ 2>/dev/null || true
+	-mv tools/binder-abi-test.dSYM $(OUT)/ 2>/dev/null || true
 
 else
 
@@ -117,7 +119,9 @@ kextfs:
 	mv kext/devfs.kext kext/devfs.kext.dSYM $(OUT)
 	$(MAKE) -C tools
 	mv tools/binder-probe $(OUT)/
+	mv tools/binder-abi-test $(OUT)/
 	-mv tools/binder-probe.dSYM $(OUT)/ 2>/dev/null || true
+	-mv tools/binder-abi-test.dSYM $(OUT)/ 2>/dev/null || true
 
 endif
 
@@ -142,6 +146,21 @@ load: kextfs
 unload:
 	sudo kmutil unload -b $(BUNDLE_ID) 2>/dev/null || true
 	sudo kmutil clear-staging 2>/dev/null || true
+
+# The functional test, against a live load. Skips rather than fails when the
+# kext is not loaded, so CI stays a compile gate (the same shape as the procfs
+# sibling's `check`).
+check: kextfs
+	@if [ -e /dev/binder ]; then \
+		echo "==> binder functional test"; \
+		$(OUT)/binder-probe; rc=$$?; \
+		if [ $$rc -eq 77 ]; then \
+			echo "SKIP: nothing to test against"; exit 0; \
+		fi; \
+		exit $$rc; \
+	else \
+		echo "SKIP: /dev/binder is not present (sudo make load first)"; \
+	fi
 
 # ---------------------------------------------------------------------------
 # Install / uninstall  (operate on the already-built $(OUT); need root)
@@ -172,4 +191,4 @@ clean:
 	$(MAKE) -C tools clean || true
 	rm -rf $(OUT)
 
-.PHONY: all kextfs load unload install uninstall clean
+.PHONY: all kextfs load unload check install uninstall clean

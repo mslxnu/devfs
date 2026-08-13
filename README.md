@@ -1,101 +1,213 @@
 # mSL/DevFS
 
-`/dev/binder` (and friends) for Android/Waydroid userspace running under mSL/NABI.
+[![C/C++ CI](https://github.com/mslxnu/mSL-DevFS/actions/workflows/c-cpp.yml/badge.svg)](https://github.com/mslxnu/mSL-DevFS/actions/workflows/c-cpp.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+![Platform](https://img.shields.io/badge/platform-macOS-lightgrey.svg)
+![Architecture](https://img.shields.io/badge/arch-arm64e%20%7C%20x86__64-blue.svg)
 
-## Status
+Linux-compatible character devices for macOS — starting with `/dev/binder`,
+Android's IPC driver, so Android userspace running under mSL/NABI can talk.
 
-**M0 complete** — scaffold + proof-of-life kext implemented. The kext compiles for arm64e, x86_64, and universal (fat) architectures, registers a cdevsw, creates `/dev/binder`, and answers `BINDER_VERSION` ioctl with protocol version 8.
+One module of **mSL/XNU**, a modular macOS Subsystem for Linux.
 
-## Architecture
+> **Status: early.** The driver is complete enough to carry real binder traffic —
+> transactions and replies, the object and handle translation between processes,
+> the reference-counting protocol, death notifications, `poll()`, and the three
+> Android contexts — and it builds clean for arm64e, x86_64 and universal. It has
+> **not yet been run against a loaded kernel**: the load needs a password this
+> repository's build cannot supply. `out/binder-probe` is the test that decides
+> whether it works; see [Testing](#testing). Descriptor passing
+> (`BINDER_TYPE_FD`) is deliberately incomplete — see
+> [What macOS will not do](#what-macos-will-not-do).
 
-Three planes, each owned by the layer that macOS actually allows:
+## The larger project
 
-- **Control plane (kext)** — `cdevsw` + `devfs_make_node` for `/dev/binder`, `/dev/hwbinder`, `/dev/vndbinder`. `d_open`/`d_close`/`d_ioctl`/`d_select` with `msleep`/`wakeup` blocking.
-- **Data plane (kext, C++)** — `IOService` + `IOUserClient` for the shared receive buffer (the `mmap` that Linux binder requires).
-- **Capability plane (userspace)** — `BINDER_TYPE_FD`/`FDA` fd passing brokered via `SCM_RIGHTS` over a userspace shim/daemon (M4).
+| Piece | What it does | Where |
+|-------|--------------|-------|
+| **Filesystem Hierarchy Standard** | The Linux filesystem layout, natively | mSL/FHS |
+| **Syscall translation** | Linux system calls onto Darwin's, over `Hypervisor.framework` | mSL/NABI |
+| **procfs** | `/proc`, as a real filesystem | mSL/ProcFS |
+| **sysfs** | `/sys`, likewise | mSL/SysFS |
+| **devfs** | Linux device drivers macOS has no equivalent for | **this repository** |
 
-## Repository Layout
+The sibling READMEs list `/dev` as "already part of macOS — XNU", which is true
+of the *filesystem* and beside the point for the *drivers*. macOS has a devfs;
+what it does not have is binder. SIP refuses a second devfs stacked over `/dev`
+anyway, so these nodes are published into XNU's own.
+
+## What is binder?
+
+Android's IPC. Not a socket: a transaction names an object, carries a parcel,
+and the kernel rewrites every object reference inside that parcel so it means
+the same thing to the receiving process — a local object becomes a handle, a
+handle becomes a local object if it is going home. That translation, plus
+reference counting that tells an object's owner when the last remote user lets
+go, is what a `/dev/binder` is. `servicemanager`, every AIDL interface and every
+HAL call in Android goes through it.
+
+mSL/NABI's porting notes closed the Waydroid question with the observation that
+`/dev/binder` "is a kernel driver with no macOS equivalent and nothing here
+could supply one". This repository supplies one.
+
+### Design
+
+| Linux | Here |
+|---|---|
+| `drivers/android/binder.c` | `kext/binder_*.c` |
+| `/dev/binder`, `/dev/hwbinder`, `/dev/vndbinder` | the same, via `devfs_make_node_clone` |
+| binderfs mounted at `/dev/binderfs` | `/dev/binderfs/binder-control`, minting nodes beside itself |
+| one `binder_proc` per `open()` | one per open, via a **cloning** device |
+| `mmap()` of the driver | a client-registered arena (`BINDER_MSL_SET_ARENA`) |
+| `BINDER_TYPE_FD` moves a descriptor | passed to a userspace broker |
+| `/dev/ashmem` | not a device: Darwin shared memory, in the NABI shim |
+
+## What macOS will not do
+
+Three findings shaped everything above. All were verified against the XNU source
+for the running kernel and the KPI export lists, not inferred:
+
+**`mmap()` of a character device does not exist.** `bsd/kern/kern_mman.c`
+answers `ENODEV` for every `VCHR` vnode, and `cdevsw.d_mmap` has no callers
+anywhere in the kernel — the BSD page-number contract was dropped. Binder's
+receive buffer is normally that mapping, so instead the client allocates the
+region itself and registers it, and the driver copies each payload into it in
+the receiving thread's own context, which is the one place a `copyout` to that
+address is legal. It costs one extra copy per transaction; everything userspace
+observes is unchanged.
+
+**No kext can install a descriptor into a process.** `sys/file.h` exposes five
+calls, all operating on the caller's own descriptors; `falloc`, `fp_lookup` and
+`fp_drop` are exported to nothing. `BINDER_TYPE_FD` therefore travels with the
+sender's descriptor number and the sender's pid (in a field Linux leaves as
+padding), for a userspace broker to resolve over `SCM_RIGHTS`. `BINDER_TYPE_FDA`
+is refused outright rather than delivered as numbers that mean nothing.
+
+**The ioctl direction bits are inverted.** BSD's `_IOW` is `IOC_IN`; Linux's is
+the other bit, and XNU acts on them before the driver is called — a
+Linux-numbered `_IOW` arrives as a buffer of zeroes. Clients send
+`BINDER_CMD_HOST(cmd)`, which sets both; the driver matches on
+`BINDER_CMD_KEY(cmd)`, which masks them off, and refuses data-carrying commands
+that arrive without the input bit rather than acting on zeroes.
+
+## Feature status
+
+**Working (built, not yet run against a loaded kernel):**
+
+- `/dev/binder`, `/dev/hwbinder`, `/dev/vndbinder` — three separate contexts,
+  each with its own context manager, objects and handle numbering
+- `/dev/binderfs/binder-control` with `BINDER_CTL_ADD`, minting further contexts
+- `BINDER_VERSION` (protocol 8), `BINDER_SET_MAX_THREADS`,
+  `BINDER_SET_CONTEXT_MGR`, `BINDER_SET_CONTEXT_MGR_EXT`, `BINDER_THREAD_EXIT`,
+  `BINDER_GET_NODE_DEBUG_INFO`, `BINDER_GET_NODE_INFO_FOR_REF`,
+  `BINDER_WRITE_READ`
+- the full command streams: `BC_TRANSACTION`/`BC_REPLY` and their scatter-gather
+  forms, `BC_FREE_BUFFER`, the four reference commands and their `_DONE`
+  acknowledgements, the looper commands, death notification request and clear;
+  `BR_TRANSACTION`/`BR_REPLY`, `BR_INCREFS`/`ACQUIRE`/`RELEASE`/`DECREFS`,
+  `BR_DEAD_BINDER`, `BR_SPAWN_LOOPER`, `BR_FAILED_REPLY`/`BR_DEAD_REPLY`
+- object translation across processes, including `BINDER_TYPE_PTR`
+  scatter-gather buffers
+- asynchronous transactions, one at a time per object, with the rest queued on it
+- `poll()`/`select()` readiness that agrees with the read loop
+- teardown on close: objects declared dead, handles dropped, callers waiting on
+  a reply told `BR_DEAD_REPLY`
+- diagnostic counters under `sysctl devfs`
+
+**Not implemented:**
+
+- `BINDER_TYPE_FD` end to end (the kernel half is done; the broker is NABI's)
+- `BINDER_TYPE_FDA` descriptor arrays — refused
+- nested scatter-gather (`BINDER_BUFFER_FLAG_HAS_PARENT`) — refused
+- `BINDER_FREEZE` / `BINDER_GET_FROZEN_INFO`, oneway spam detection,
+  `BINDER_GET_EXTENDED_ERROR`
+- the security-context transaction form (`BR_TRANSACTION_SEC_CTX`)
+- `/dev/ashmem` — deliberately, see [doc/NABI-INTEGRATION.md](doc/NABI-INTEGRATION.md)
+- fine-grained locking: the driver holds one mutex, by choice, and says why in
+  `include/fs/devfs/binder_internal.h`
+
+## Repository layout
 
 ```
 mSL-DevFS/
-├── .github/workflows/c-cpp.yml   CI: make ARCH=arm64e / x86_64 / universal
-├── .gitignore
-├── .gitmodules                   lib/libkext, lib/xnu, lib/MacKernelSDK
-├── LICENSE                       MIT
-├── Makefile                      all-in-one orchestrator (build/install/unload/clean)
-├── Makefile.inc                  KEXTNAME=devfs, BUNDLEDOMAIN=com.beako.filesystems
-├── VERSION                       0.0.1
-├── README.md                     this file
+├── doc/NABI-INTEGRATION.md   what mSL/NABI must do, and what Waydroid still needs
 ├── include/fs/devfs/
-│   ├── binder.h                  shared wire protocol (ioctls, binder_version)
-│   └── devfs.h                   kernel-only bundle defs, cdevsw
-├── include/xnu/                  vendored XNU private headers (+ bsd/sys/conf.h)
-├── kext/                         the kernel extension
-├── lib/                          git submodules
-├── out/                          build output (gitignored)
-└── tools/                        userspace smoke test (binder-probe)
+│   ├── binder.h              the Linux binder ABI, shared with userspace and NABI
+│   └── binder_internal.h     the driver's own state, and why it is shaped that way
+├── include/xnu/              vendored XNU private headers
+├── kext/
+│   ├── devfs.c               module start/stop, device major, diagnostic sysctls
+│   ├── binder_dev.c          the cdevsw, the cloning nodes, the contexts, binderfs
+│   ├── binder_proc.c         processes, threads, queues, the read and write loops
+│   ├── binder_node.c         objects, handles, reference counting, death
+│   ├── binder_txn.c          transactions and object translation
+│   └── binder_alloc.c        the transaction arena
+├── lib/                      git submodules (libkext, xnu)
+├── out/                      build output (gitignored)
+└── tools/
+    ├── binder-probe.c        the functional test
+    └── binder-abi-test.c     the ABI gate: every constant against its _IOC form
 ```
 
 ## Building
 
 ```bash
-# Initialize submodules
-git submodule update --init
-
-# Build for native architecture (arm64e on Apple Silicon)
-make
-
-# Build for specific architecture
-make ARCH=arm64e
+git submodule update --init lib/libkext
+make                    # native arch (arm64e here)
 make ARCH=x86_64
-
-# Build universal (fat) kext
 make ARCH=universal
 ```
 
-Artifacts are placed in `out/`:
-- `devfs.kext` — the kernel extension bundle
-- `binder-probe` — userspace smoke test
+Never build as root: `make install` only copies what `make` already built, so
+every artifact stays owned by the invoking user.
 
-## Installing / Loading
+## Loading
+
+Third-party kexts on Apple Silicon need Reduced Security and a reboot before
+they will load at all. With that done:
 
 ```bash
-# Install to /Library/Extensions (requires root)
-sudo make install
-
-# Load the installed kext (requires root)
 sudo make load
+```
 
-# Unload
+`make load` clears the kext staging area first — macOS caches third-party kexts
+in the Auxiliary Kernel Collection, and a stale staged copy otherwise shadows a
+freshly built one, which costs an afternoon the first time it happens.
+
+```bash
 sudo make unload
-
-# Uninstall
-sudo make uninstall
 ```
 
 ## Testing
 
-After loading, run the smoke test:
+The ABI gate runs as part of every build: `tools/binder-abi-test.c` recomputes
+each ioctl number and command code from Linux's `_IOC` encoding applied to the
+struct the ABI names, and fails the build if a literal disagrees. It exists
+because the first draft of the header carried a fabricated 24-byte
+`binder_version` (Linux's is 4 bytes), inverted direction bits on every `BC_`/
+`BR_` code, and a constant size field — none of which is visible by inspection.
+
+The functional test needs the kext loaded:
 
 ```bash
-out/binder-probe
-# Expected output:
-# BINDER_VERSION: protocol_version=8
-# PASS: BINDER_VERSION returns 8
+make check
 ```
 
-## Milestones
+It walks the protocol the way libbinder does: the device answers and reports
+protocol 8; the arena is registered and its bounds enforced; a context manager
+registers once and only once, per context; a oneway transaction to ourselves
+completes and its payload arrives byte-for-byte inside the registered arena; a
+synchronous call is served and replied to across two threads; `poll()` reports
+readable exactly when there is work; and an object passed to a second process
+arrives as a handle whose holder is told when its owner exits.
 
-- **M0** (complete) — Scaffold + proof-of-life: `/dev/binder` exists, `BINDER_VERSION` returns 8
-- **M1** — Protocol core (cdev only, copy-based): per-process/thread state, node/ref model, transaction engine, blocking read
-- **M2** — Data plane: shared receive buffer via `IOUserClient`, `mmap` support via NABI `do_mmap` hook
-- **M3** — Full device set: `/dev/hwbinder`, `/dev/vndbinder`, `/dev/ashmem`, binderfs
-- **M4** — Capability plane: `BINDER_TYPE_FD`/`FDA` via userspace `SCM_RIGHTS` shim
+`make check` skips cleanly when nothing is loaded, so CI stays a compile gate.
 
-## Cross-Repo Contract
+## Credits
 
-`mSL-DevFS/include/fs/devfs/binder.h` and `mSL-NABI/include/linux/binder.h` (M1) must be byte-identical on wire structs and ioctl values.
+The protocol, and much of the shape of the implementation, is Android's binder
+driver — `drivers/android/binder.c`. Where this driver departs from it, the
+reason is written down next to the departure.
 
 ## License
 
-MIT License — Copyright (c) 2026 Sunneva N. Mariu
+MIT. See [LICENSE](LICENSE).

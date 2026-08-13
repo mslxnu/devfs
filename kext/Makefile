@@ -124,6 +124,11 @@ LDFLAGS+= -target $(TARGET_TRIPLE) \
           -nostdlib \
           -Xlinker -kext \
           -Xlinker -object_path_lto devfs.o \
+          -Xlinker -object_path_lto binder_dev.o \
+          -Xlinker -object_path_lto binder_proc.o \
+          -Xlinker -object_path_lto binder_node.o \
+          -Xlinker -object_path_lto binder_txn.o \
+          -Xlinker -object_path_lto binder_alloc.o \
           -Xlinker -export_dynamic
 
 # The scaffold links only libkext (uuid/assert helpers) and the SDK's libkmod.

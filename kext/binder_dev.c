@@ -417,6 +417,53 @@ binder_dev_ioctl(dev_t dev, u_long cmd, caddr_t data, int fflag, struct proc *p)
 		 * scheduling experiment that never shipped. */
 		break;
 
+	case BINDER_CMD_KEY(BINDER_FREEZE): {
+		struct binder_freeze_info *info = (struct binder_freeze_info *)data;
+		struct binder_thread *thread;
+		bool found = false;
+
+		LIST_FOREACH(thread, &proc->threads, entry) {
+			if (thread->tid == info->pid) {
+				thread->frozen = (info->enable != 0);
+				thread->freeze_timeout_ms = info->timeout_ms;
+				found = true;
+				break;
+			}
+		}
+		if (!found)
+			ret = EINVAL;
+		break;
+	}
+	case BINDER_CMD_KEY(BINDER_GET_FROZEN_INFO): {
+		struct binder_frozen_status_info *info = (struct binder_frozen_status_info *)data;
+		struct binder_thread *thread;
+		bool found = false;
+
+		info->sync_recv = 0;
+		info->async_recv = 0;
+
+		LIST_FOREACH(thread, &proc->threads, entry) {
+			if (thread->tid == info->pid) {
+				info->sync_recv = 0; /* TODO: track per-thread counts */
+				info->async_recv = 0;
+				found = true;
+				break;
+			}
+		}
+		if (!found)
+			ret = EINVAL;
+		break;
+	}
+	case BINDER_CMD_KEY(BINDER_ENABLE_ONEWAY_SPAM_DETECTION):
+		proc->oneway_spam_detection = (*(uint32_t *)data != 0);
+		break;
+	case BINDER_CMD_KEY(BINDER_GET_EXTENDED_ERROR): {
+		struct binder_extended_error *ee = (struct binder_extended_error *)data;
+		*ee = proc->last_error;
+		bzero(&proc->last_error, sizeof(proc->last_error));
+		break;
+	}
+
 	default:
 		ret = ENOTTY;
 		break;

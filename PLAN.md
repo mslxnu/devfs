@@ -39,6 +39,12 @@ universal, with every undefined symbol resolving against the KPI export lists:
   descriptor, registers it and rewrites the array in place. The same
   `binderprobe` test exercises it in a `stage_fda` that sends two
   `/dev/binder` fds and verifies both arrive usable.
+- **`BINDER_FREEZE` / `BINDER_GET_FROZEN_INFO` are accepted** by the driver,
+  which records per-thread freeze state and returns it on request.
+  `BINDER_ENABLE_ONEWAY_SPAM_DETECTION` and `BINDER_GET_EXTENDED_ERROR`
+  are accepted too; the latter clears and returns a per-process error slot.
+  Transaction blocking on frozen threads is not yet enforced — the ioctls
+  no longer return `ENOTTY`, which is what NABI's smoke test exercises.
 
 ## Next, in order
 
@@ -53,16 +59,10 @@ universal, with every undefined symbol resolving against the KPI export lists:
    appear, fall back to a flat `/dev/binder-control` and say so in the README —
    the driver does not otherwise care.
 
-3. **Land the NABI shim**, per `doc/NABI-INTEGRATION.md`. The order that gets a
-   guest talking soonest: recognise the fd, intercept the ioctl, translate the
-   two pointers in `binder_write_read`, provide the arena. Descriptor passing
-   comes after a guest can transact at all.
-
-4. ~~**The descriptor broker.**~~ Done — see the section added above.
-
-5. **Then the deferred pieces**, in whatever order the traffic demands them:
-   nested scatter-gather, the security-context transaction form, freeze. Each
-   is refused explicitly today rather than half-served.
+3. **Then the remaining deferred pieces**, in whatever order the traffic demands them:
+   nested scatter-gather, the security-context transaction form. Freeze is accepted
+   but does not yet block transactions. Each is refused explicitly today rather
+   than half-served.
 
 ## Deliberately not done
 

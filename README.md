@@ -128,10 +128,10 @@ that arrive without the input bit rather than acting on zeroes.
 
 **Not implemented:**
 
-- `BINDER_TYPE_FD` end to end (the kernel half is done; the broker is NABI's)
 - nested scatter-gather (`BINDER_BUFFER_FLAG_HAS_PARENT`) — refused
 - `BINDER_FREEZE` / `BINDER_GET_FROZEN_INFO`, oneway spam detection,
-  `BINDER_GET_EXTENDED_ERROR`
+  `BINDER_GET_EXTENDED_ERROR` — accepted and recorded; transaction blocking
+  not yet enforced
 - the security-context transaction form (`BR_TRANSACTION_SEC_CTX`)
 - `/dev/ashmem` — deliberately, see [doc/NABI-INTEGRATION.md](doc/NABI-INTEGRATION.md)
 - fine-grained locking: the driver holds one mutex, by choice, and says why in

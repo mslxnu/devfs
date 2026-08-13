@@ -260,6 +260,9 @@ struct binder_thread {
 	struct binder_error return_error;
 	struct binder_error reply_error;
 	int debug_id;
+
+	bool frozen;
+	uint32_t freeze_timeout_ms;
 };
 
 #pragma mark -
@@ -307,6 +310,9 @@ struct binder_proc {
 
 	struct selinfo selinfo;
 	bool sel_recorded;
+
+	bool oneway_spam_detection;
+	struct binder_extended_error last_error;
 };
 
 #pragma mark -

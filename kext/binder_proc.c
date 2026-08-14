@@ -785,7 +785,7 @@ binder_read_transaction(struct binder_proc *proc, struct binder_thread *thread,
 	}
 	tr_secctx.transaction_data.code = t->code;
 	tr_secctx.transaction_data.flags = t->flags;
-	tr_secctx.transaction_data.sender_pid = (t->from != NULL) ? t->sender_pid : 0;
+	tr_secctx.transaction_data.sender_pid = t->sender_pid;
 	tr_secctx.transaction_data.sender_euid = t->sender_euid;
 	tr_secctx.transaction_data.data_size = buf->data_size;
 	tr_secctx.transaction_data.offsets_size = buf->offsets_size;

@@ -40,6 +40,8 @@
 #pragma mark External References
 
 struct cdevsw *binder_cdevsw_ptr(void);
+int android_devices_init(int binder_major);
+void android_devices_fini(void);
 
 #pragma mark -
 #pragma mark Module State
@@ -226,6 +228,12 @@ devfs_start(kmod_info_t *ki, __unused void *d)
 		goto fail_cdevsw;
 	}
 
+	ret = android_devices_init(g_devfs_major);
+	if (ret != 0) {
+		os_log(OS_LOG_DEFAULT, "devfs: android_devices_init failed (%d) \n", ret);
+		goto fail_android;
+	}
+
 	devfs_sysctl_register();
 
 	os_log(OS_LOG_DEFAULT, "loaded %s version %s build %s (%s), binder major %d \n",
@@ -245,6 +253,7 @@ fail_lock:
 fail_grp:
 	lck_grp_free(devfs_lck_grp);
 	devfs_lck_grp = NULL;
+fail_android:
 	return KERN_FAILURE;
 }
 
@@ -260,6 +269,7 @@ devfs_stop(__unused kmod_info_t *ki, __unused void *d)
 	 * runs every binder_proc has already been through binder_proc_release.
 	 */
 	devfs_sysctl_unregister();
+	android_devices_fini();
 	binder_devices_fini();
 
 	if (g_devfs_major != -1) {

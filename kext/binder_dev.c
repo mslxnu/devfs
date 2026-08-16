@@ -60,6 +60,7 @@
 struct binder_open_slot {
 	bool cloned;                        /* a minor was handed out          */
 	bool opened;                        /* and an open() followed          */
+	pid_t lookup_pid;                   /* who asked, while unopened       */
 	struct binder_context *context;
 	struct binder_proc *proc;
 	uint64_t sequence;                  /* for reclaiming stale clones     */
@@ -95,11 +96,27 @@ binder_slot_for_dev(dev_t dev)
  * Hand out a minor for a new open. Called by devfs at lookup time, with
  * the *base* dev of the node being looked up - which is how the new open
  * learns its context.
+ *
+ * "At lookup time" is the trap, and it is worth being explicit about
+ * because the first version of this walked straight into it. devfs clones
+ * per *lookup*, not per open, so every stat() of /dev/binder minted a fresh
+ * minor: five stats in a row reported five different rdevs, and anything
+ * identifying the device that way - as mSL/NABI does when deciding whether
+ * a descriptor is a binder descriptor - saw a different device each time it
+ * looked. It also burned a slot per lookup, seven per stat(1) call and ten
+ * per path resolution in the guest, so the table emptied in a few hundred.
+ *
+ * The callback runs in the looking-up thread's own context, so the fix is
+ * to recognise the caller: a process that already holds a cloned but
+ * unopened slot for this context gets that same slot back. Repeated stats
+ * are then stable and cost one slot, and the slot is consumed by the open
+ * that follows - which is the one the process was heading for.
  */
 static int
 binder_clone(dev_t dev, int action)
 {
 	struct binder_context *ctx;
+	pid_t pid;
 	int i, oldest = -1;
 	uint64_t oldest_seq = ~0ull;
 
@@ -111,14 +128,27 @@ binder_clone(dev_t dev, int action)
 	if (ctx == NULL) {
 		return -1;
 	}
+	pid = proc_selfpid();
 
 	BINDER_LOCK();
+
+	/* This process's outstanding lookup, if it has one. */
+	for (i = 0; i < BINDER_MAX_OPENS; i++) {
+		if (g_slots[i].cloned && !g_slots[i].opened &&
+		    g_slots[i].lookup_pid == pid && g_slots[i].context == ctx) {
+			g_slots[i].sequence = ++g_slot_sequence;
+			BINDER_UNLOCK();
+			return BINDER_CLONE_BASE + i;
+		}
+	}
+
 	for (i = 0; i < BINDER_MAX_OPENS; i++) {
 		if (!g_slots[i].cloned) {
 			break;
 		}
-		/* Remember the longest-standing clone that never became an open;
-		 * see the note about stat() in the file comment. */
+		/* The longest-standing clone that never became an open. Safe to
+		 * take back: every open performs its own lookup, so no open is
+		 * waiting on a minor handed out earlier. */
 		if (!g_slots[i].opened && g_slots[i].sequence < oldest_seq) {
 			oldest_seq = g_slots[i].sequence;
 			oldest = i;
@@ -136,6 +166,7 @@ binder_clone(dev_t dev, int action)
 
 	g_slots[i].cloned = true;
 	g_slots[i].opened = false;
+	g_slots[i].lookup_pid = pid;
 	g_slots[i].context = ctx;
 	g_slots[i].proc = NULL;
 	g_slots[i].sequence = ++g_slot_sequence;
@@ -168,7 +199,19 @@ binder_dev_open(dev_t dev, int flags, int devtype, struct proc *p)
 		return ENXIO;
 	}
 	if (slot->opened) {
+		/*
+		 * Two opens raced on one cloned minor. Only reachable when two
+		 * threads of the same process look up the same device at the
+		 * same time, because a lookup now reuses that process's
+		 * outstanding slot rather than minting a minor per lookup - the
+		 * trade that makes rdev stable. Sequential opens are unaffected:
+		 * the slot is released at close and the next lookup allocates a
+		 * fresh one. Said out loud rather than returned silently,
+		 * because a bare EBUSY here would be very hard to place.
+		 */
 		BINDER_UNLOCK();
+		printf("devfs: binder: concurrent open of one cloned minor by "
+		    "pid %d; the second is refused\n", proc_selfpid());
 		return EBUSY;
 	}
 	proc = binder_proc_new(slot->context);
@@ -178,6 +221,7 @@ binder_dev_open(dev_t dev, int flags, int devtype, struct proc *p)
 	}
 	slot->proc = proc;
 	slot->opened = true;
+	slot->lookup_pid = 0;
 	BINDER_UNLOCK();
 	return 0;
 }
@@ -198,6 +242,7 @@ binder_dev_close(dev_t dev, int flags, int devtype, struct proc *p)
 	}
 	slot->cloned = false;
 	slot->opened = false;
+	slot->lookup_pid = 0;
 	slot->context = NULL;
 	BINDER_UNLOCK();
 	return 0;

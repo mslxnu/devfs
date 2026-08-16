@@ -401,10 +401,37 @@ test_context_manager(void)
 	ok(bioctl(a.fd, BINDER_SET_CONTEXT_MGR, &zero) == 0,
 	    "BINDER_SET_CONTEXT_MGR is accepted");
 
-	if (binder_connect(&b, "/dev/binder")) {
-		ok(bioctl(b.fd, BINDER_SET_CONTEXT_MGR, &zero) < 0,
-		    "a second context manager is refused");
-		binder_disconnect(&b);
+	/*
+	 * A second manager must be refused - and the claim has to come from
+	 * another process. A process gets one binder descriptor per context
+	 * (the minor is what distinguishes one open from another, and it is
+	 * bound to the process so that rdev is stable), so a second open here
+	 * would fail on EBUSY before the driver was ever asked about the
+	 * manager, and the check would pass while testing nothing. Silently
+	 * skipping it is how it went missing in the first place.
+	 */
+	{
+		pid_t kid = fork();
+		int status = 0;
+
+		if (kid == 0) {
+			struct binder_conn c2 = { -1, NULL };
+			int rc = 3;
+
+			close(a.fd);            /* not ours; it came with the fork */
+			if (binder_connect(&c2, "/dev/binder")) {
+				rc = bioctl(c2.fd, BINDER_SET_CONTEXT_MGR, &zero) < 0 ? 0 : 1;
+				binder_disconnect(&c2);
+			}
+			_exit(rc);
+		}
+		if (kid < 0) {
+			ok(false, "fork a second claimant");
+		} else {
+			waitpid(kid, &status, 0);
+			ok(WIFEXITED(status) && WEXITSTATUS(status) == 0,
+			    "a second context manager is refused, from another process");
+		}
 	}
 
 	/* The contexts are separate namespaces: taking the role in one says

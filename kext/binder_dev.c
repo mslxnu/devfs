@@ -55,12 +55,12 @@
  */
 #define BINDER_CTL_MINOR    63          /* binderfs's binder-control       */
 #define BINDER_CLONE_BASE   64          /* first per-open minor            */
-#define BINDER_MAX_OPENS    448         /* 64..511, one per open device    */
+#define BINDER_MAX_OPENS    1024        /* one per (process, context) pair  */
 
 struct binder_open_slot {
 	bool cloned;                        /* a minor was handed out          */
 	bool opened;                        /* and an open() followed          */
-	pid_t lookup_pid;                   /* who asked, while unopened       */
+	pid_t lookup_pid;                   /* the process this slot belongs to */
 	struct binder_context *context;
 	struct binder_proc *proc;
 	uint64_t sequence;                  /* for reclaiming stale clones     */
@@ -106,11 +106,27 @@ binder_slot_for_dev(dev_t dev)
  * looked. It also burned a slot per lookup, seven per stat(1) call and ten
  * per path resolution in the guest, so the table emptied in a few hundred.
  *
- * The callback runs in the looking-up thread's own context, so the fix is
- * to recognise the caller: a process that already holds a cloned but
- * unopened slot for this context gets that same slot back. Repeated stats
- * are then stable and cost one slot, and the slot is consumed by the open
- * that follows - which is the one the process was heading for.
+ * The callback runs in the looking-up thread's own context, so it can
+ * recognise the caller, and a slot belongs to a (process, context) pair for
+ * as long as that process lives - through the open, through the close, and
+ * through every later lookup. That is what makes the number an identity
+ * rather than a counter: a process comparing fstat(fd).st_rdev against
+ * stat("/dev/binder").st_rdev gets the same answer, which is the whole
+ * point and does not hold if the slot is released at close.
+ *
+ * Two processes still see different minors for the same device, and there
+ * is no way around that while a minor is what distinguishes one open from
+ * another. rdev is therefore an identity within a process and not across
+ * one; the major is the part that is the same for everybody, and it is what
+ * identifies a descriptor as a binder descriptor at all.
+ *
+ * Slots are given up under pressure, oldest unopened first, without asking
+ * whether the process still exists - proc_find() would answer that, but it
+ * takes the process list lock while this holds the driver lock and runs
+ * inside devfs's own, and a third lock in that order is not worth a
+ * reclaim heuristic. The cost of being wrong is that one live process sees
+ * its minor change once, under a pressure that only arrives after a
+ * thousand processes have touched binder.
  */
 static int
 binder_clone(dev_t dev, int action)
@@ -132,10 +148,10 @@ binder_clone(dev_t dev, int action)
 
 	BINDER_LOCK();
 
-	/* This process's outstanding lookup, if it has one. */
+	/* This process's slot for this context, if it already has one. */
 	for (i = 0; i < BINDER_MAX_OPENS; i++) {
-		if (g_slots[i].cloned && !g_slots[i].opened &&
-		    g_slots[i].lookup_pid == pid && g_slots[i].context == ctx) {
+		if (g_slots[i].cloned && g_slots[i].lookup_pid == pid &&
+		    g_slots[i].context == ctx) {
 			g_slots[i].sequence = ++g_slot_sequence;
 			BINDER_UNLOCK();
 			return BINDER_CLONE_BASE + i;
@@ -221,7 +237,6 @@ binder_dev_open(dev_t dev, int flags, int devtype, struct proc *p)
 	}
 	slot->proc = proc;
 	slot->opened = true;
-	slot->lookup_pid = 0;
 	BINDER_UNLOCK();
 	return 0;
 }
@@ -240,10 +255,13 @@ binder_dev_close(dev_t dev, int flags, int devtype, struct proc *p)
 		binder_proc_release(slot->proc);
 		slot->proc = NULL;
 	}
-	slot->cloned = false;
+	/*
+	 * The binder state goes; the minor stays with the process, so that a
+	 * close followed by another open does not move the device underneath
+	 * anything that recorded its rdev. The slot is recovered when the
+	 * table comes under pressure.
+	 */
 	slot->opened = false;
-	slot->lookup_pid = 0;
-	slot->context = NULL;
 	BINDER_UNLOCK();
 	return 0;
 }

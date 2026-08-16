@@ -748,6 +748,7 @@ binder_read_transaction(struct binder_proc *proc, struct binder_thread *thread,
 	struct binder_buffer *buf = t->buffer;
 	user_addr_t uaddr;
 	uint32_t cmd;
+	bool is_transaction, want_secctx;
 	int ret;
 	const char *secctx_str = "u:r:untrusted_app:s0";
 	size_t secctx_len = strlen(secctx_str) + 1;
@@ -778,7 +779,32 @@ binder_read_transaction(struct binder_proc *proc, struct binder_thread *thread,
 	}
 
 	bzero(&tr_secctx, sizeof(tr_secctx));
-	cmd = BR_TRANSACTION_SEC_CTX;
+
+	/*
+	 * Which of the three forms this delivery takes, which is not a free
+	 * choice: it decides how many bytes the client reads next, and whether
+	 * it believes it owes a reply.
+	 *
+	 * A reply is always BR_REPLY. It answers a call the receiver is
+	 * already waiting on, carries no security context because nothing is
+	 * being granted, and must not be labelled a transaction or the client
+	 * will try to answer its own answer. An incoming transaction is
+	 * BR_TRANSACTION, or BR_TRANSACTION_SEC_CTX when the target node asked
+	 * for a context with FLAT_BINDER_FLAG_TXN_SECURITY_CTX - which is what
+	 * servicemanager sets and ordinary services do not.
+	 *
+	 * Sending everything as BR_TRANSACTION_SEC_CTX broke both halves of
+	 * that: replies arrived labelled as calls, and the push below - which
+	 * tested for BR_TRANSACTION - stopped happening at all, so no receiver
+	 * was ever recorded as owing a reply and every BC_REPLY came back
+	 * BR_FAILED_REPLY. Synchronous binder does not work without this.
+	 */
+	is_transaction = (buf->target_node != NULL);
+	want_secctx = is_transaction && (buf->target_node->flags &
+	    FLAT_BINDER_FLAG_TXN_SECURITY_CTX) != 0;
+	cmd = !is_transaction ? BR_REPLY :
+	    (want_secctx ? BR_TRANSACTION_SEC_CTX : BR_TRANSACTION);
+
 	if (buf->target_node != NULL) {
 		tr_secctx.transaction_data.target.ptr = buf->target_node->ptr;
 		tr_secctx.transaction_data.cookie = buf->target_node->cookie;
@@ -792,27 +818,38 @@ binder_read_transaction(struct binder_proc *proc, struct binder_thread *thread,
 	tr_secctx.transaction_data.data.ptr.buffer = (binder_uintptr_t)uaddr;
 	tr_secctx.transaction_data.data.ptr.offsets = (binder_uintptr_t)(uaddr + BINDER_ALIGN(buf->data_size));
 
-	tr_secctx.secctx = (binder_uintptr_t)(buffer + *consumed +
-	    sizeof(uint32_t) + sizeof(tr_secctx));
+	if (want_secctx) {
+		tr_secctx.secctx = (binder_uintptr_t)(buffer + *consumed +
+		    sizeof(uint32_t) + sizeof(tr_secctx));
 
-	ret = binder_put_cmd_data(buffer, size, consumed, cmd,
-	    &tr_secctx, sizeof(tr_secctx));
-	if (ret != 0) {
-		return ret;
-	}
+		ret = binder_put_cmd_data(buffer, size, consumed, cmd,
+		    &tr_secctx, sizeof(tr_secctx));
+		if (ret != 0) {
+			return ret;
+		}
 
-	if (size - *consumed < secctx_len) {
-		return ENOMEM;
+		if (size - *consumed < secctx_len) {
+			return ENOMEM;
+		}
+		if (copyout(secctx_str, buffer + *consumed, secctx_len) != 0) {
+			return EFAULT;
+		}
+		*consumed += secctx_len;
+	} else {
+		/* The ordinary forms carry the transaction data alone - the
+		 * secctx variant's first member, and nothing after it. */
+		ret = binder_put_cmd_data(buffer, size, consumed, cmd,
+		    &tr_secctx.transaction_data,
+		    sizeof(tr_secctx.transaction_data));
+		if (ret != 0) {
+			return ret;
+		}
 	}
-	if (copyout(secctx_str, buffer + *consumed, secctx_len) != 0) {
-		return EFAULT;
-	}
-	*consumed += secctx_len;
 
 	/* From here the client owns the buffer until it says BC_FREE_BUFFER. */
 	buf->allow_user_free = true;
 
-	if (cmd == BR_TRANSACTION && t->need_reply) {
+	if (is_transaction && t->need_reply) {
 		t->to_thread = thread;
 		t->to_parent = thread->transaction_stack;
 		thread->transaction_stack = t;

@@ -195,6 +195,30 @@ binder_disconnect(struct binder_conn *c)
 	}
 }
 
+/*
+ * Is there anything to read?
+ *
+ * A blocking BINDER_WRITE_READ with nothing queued sleeps until something
+ * arrives, so a driver that stops answering - or answers in a form this
+ * tool does not recognise, which is what a protocol change looks like from
+ * here - hangs the run instead of failing it. That is exactly what
+ * BR_TRANSACTION_SEC_CTX did the first time it appeared. select() is the
+ * readiness call that reaches this driver (poll() cannot; see the poll
+ * stage), so every wait goes through it first and gives up on a timeout.
+ */
+static bool
+binder_readable(int fd, int ms)
+{
+	struct timeval tv;
+	fd_set rfds;
+
+	FD_ZERO(&rfds);
+	FD_SET(fd, &rfds);
+	tv.tv_sec = ms / 1000;
+	tv.tv_usec = (ms % 1000) * 1000;
+	return select(fd + 1, &rfds, NULL, NULL, &tv) == 1 && FD_ISSET(fd, &rfds);
+}
+
 /* One BINDER_WRITE_READ. Either half may be empty. */
 static int
 binder_wr(int fd, void *wbuf, size_t wsize, void *rbuf, size_t rsize,
@@ -235,6 +259,12 @@ for_each_br(const uint8_t *buf, uint64_t len,
 		case BR_REPLY:
 			plen = sizeof(struct binder_transaction_data);
 			break;
+		case BR_TRANSACTION_SEC_CTX:
+			/* The same transaction with a security context appended. Its
+			 * payload is larger, so a parser that does not know it walks
+			 * off into the payload and reads that as commands. */
+			plen = sizeof(struct binder_transaction_data_secctx);
+			break;
 		case BR_INCREFS:
 		case BR_ACQUIRE:
 		case BR_RELEASE:
@@ -272,6 +302,14 @@ br_scan_cb(uint32_t cmd, const void *payload, void *ctx)
 {
 	struct br_scan *s = ctx;
 
+	/* A driver that carries security contexts answers a transaction with
+	 * BR_TRANSACTION_SEC_CTX, whose first member is the transaction data -
+	 * so a caller asking for BR_TRANSACTION wants this too. */
+	if (cmd == BR_TRANSACTION_SEC_CTX && s->want == BR_TRANSACTION) {
+		s->seen = true;
+		memcpy(&s->tr, payload, sizeof(s->tr));
+		return;
+	}
 	if (cmd != s->want) {
 		return;
 	}
@@ -440,7 +478,7 @@ test_oneway_self(void)
 	scan.want = BR_TRANSACTION;
 	for_each_br(rbuf, consumed, br_scan_cb, &scan);
 
-	if (!scan.seen) {
+	if (!scan.seen && binder_readable(c.fd, 1000)) {
 		/* The delivery may need a second read once the first has drained
 		 * BR_TRANSACTION_COMPLETE. */
 		consumed = 0;
@@ -503,6 +541,9 @@ server_thread(void *v)
 	for (;;) {
 		struct br_scan scan;
 
+		if (!binder_readable(sa->fd, 100)) {
+			continue;
+		}
 		consumed = 0;
 		if (binder_wr(sa->fd, NULL, 0, rbuf, sizeof(rbuf), &consumed) < 0) {
 			if (errno == EINTR) {
@@ -607,6 +648,9 @@ test_request_reply(void)
 	scan.want = BR_REPLY;
 	for_each_br(rbuf, consumed, br_scan_cb, &scan);
 	for (spin = 0; spin < 200 && !scan.seen; spin++) {
+		if (!binder_readable(c.fd, 50)) {
+			continue;
+		}
 		consumed = 0;
 		if (binder_wr(c.fd, NULL, 0, rbuf, sizeof(rbuf), &consumed) < 0 &&
 		    errno != EINTR) {
@@ -888,6 +932,9 @@ test_two_process(void)
 		memset(&scan, 0, sizeof(scan));
 		scan.want = BR_DEAD_BINDER;
 		for (spin = 0; spin < 200 && !scan.seen; spin++) {
+			if (!binder_readable(cli.fd, 50)) {
+				continue;
+			}
 			consumed = 0;
 			if (binder_wr(cli.fd, NULL, 0, rbuf, sizeof(rbuf), &consumed) < 0 &&
 			    errno != EINTR) {

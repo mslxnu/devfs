@@ -100,7 +100,7 @@ that arrive without the input bit rather than acting on zeroes.
 
 ## Feature status
 
-**Working (built, not yet run against a loaded kernel):**
+**Working:**
 
 - `/dev/binder`, `/dev/hwbinder`, `/dev/vndbinder` — three separate contexts,
   each with its own context manager, objects and handle numbering

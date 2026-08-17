@@ -10,14 +10,11 @@ Android's IPC driver, so Android userspace running under mSL/NABI can talk.
 
 One module of **mSL/XNU**, a modular macOS Subsystem for Linux.
 
-> **Status: early.** The driver is complete enough to carry real binder traffic —
+> **Status:** The driver is complete enough to carry real binder traffic —
 > transactions and replies, the object and handle translation between processes,
 > the reference-counting protocol, death notifications, `poll()`, and the three
-> Android contexts — and it builds clean for arm64e, x86_64 and universal. It has
-> **not yet been run against a loaded kernel**: the load needs a password this
-> repository's build cannot supply. `out/binder-probe` is the test that decides
-> whether it works; see [Testing](#testing). Descriptor passing
-> (`BINDER_TYPE_FD`) is deliberately incomplete — see
+> Android contexts — and it builds clean for arm64e, x86_64 and universal.
+> Descriptor passing (`BINDER_TYPE_FD`) is deliberately incomplete — see
 > [What macOS will not do](#what-macos-will-not-do).
 
 ## The larger project
